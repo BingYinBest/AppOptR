@@ -3,17 +3,17 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use crate::apply_affinity::{read_cmdline, task_tids};
 use crate::cache::ProcCache;
 use crate::config::{
-    config_reload_now, spec_like,
+    config_reload_now, dyn_spec_try, spec_like,
     CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, FORCE_RELOAD, PARSE_FAILS,
 };
 use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology, DEFAULT_CPUSET_NAME};
@@ -28,6 +28,16 @@ pub static MODE_FORCE: AtomicU8 = AtomicU8::new(0);
 pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub static WEB_STATS: Mutex<Option<WebStats>> = Mutex::new(None);
+
+/// 并发连接上限，防本地恶意应用慢连接耗尽线程（每连接有 5s 读超时，慢连接可持续占用）
+const MAX_CONNS: usize = 64;
+static CONN_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// 输入建议的 /proc 扫描结果缓存，TTL 内避免重复全盘枚举
+const SUGGEST_TTL: Duration = Duration::from_secs(3);
+static SUGGEST_PKG_CACHE: Mutex<Option<(Instant, BTreeMap<String, usize>)>> = Mutex::new(None);
+type ThreadSuggestCache = BTreeMap<String, (Instant, BTreeMap<String, usize>)>;
+static SUGGEST_THREAD_CACHE: Mutex<ThreadSuggestCache> = Mutex::new(BTreeMap::new());
 
 #[derive(Clone)]
 pub struct WebStats {
@@ -58,7 +68,15 @@ pub fn web_start() {
     println!("Web: 前端已启用 http://127.0.0.1:{}/", WEB_PORT);
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            thread::spawn(move || conn_handle(stream));
+            if CONN_ACTIVE.fetch_add(1, Ordering::Relaxed) >= MAX_CONNS {
+                CONN_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+                drop(stream);
+                continue;
+            }
+            thread::spawn(move || {
+                conn_handle(stream);
+                CONN_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+            });
         }
     });
 }
@@ -234,6 +252,9 @@ fn spec_name(cpus: &CpuSet, topo: &CpuTopology) -> String {
         if *cpus == topo.e_core {
             return "e-core".into();
         }
+        if *cpus == topo.m_core {
+            return "m-core".into();
+        }
         if *cpus == topo.p_core {
             return "p-core".into();
         }
@@ -245,6 +266,27 @@ fn spec_name(cpus: &CpuSet, topo: &CpuTopology) -> String {
         }
     }
     cpus.to_range_string()
+}
+
+/// 动态规则序列化为可回写的配置文件文本（elect/load 语法）
+fn dyn_spec_str(spec: &crate::config::DynSpec, topo: &CpuTopology) -> String {
+    match spec {
+        crate::config::DynSpec::Elect { winner, others } => format!(
+            "elect({} | {})",
+            spec_name(winner, topo),
+            spec_name(others, topo)
+        ),
+        crate::config::DynSpec::Load {
+            high,
+            low,
+            threshold,
+        } => format!(
+            "load({} | {} | {})",
+            spec_name(high, topo),
+            spec_name(low, topo),
+            threshold
+        ),
+    }
 }
 
 fn status_json() -> String {
@@ -271,6 +313,7 @@ fn status_json() -> String {
         "total_procs": sys_procs(),
         "interval": CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
         "e_core": topo.map(|t| t.e_core.to_range_string()).unwrap_or_default(),
+        "m_core": topo.map(|t| t.m_core.to_range_string()).unwrap_or_default(),
         "p_core": topo.map(|t| t.p_core.to_range_string()).unwrap_or_default(),
         "hp_core": topo.map(|t| t.hp_core.to_range_string()).unwrap_or_default(),
         "all_core": topo.map(|t| t.present_str.clone()).unwrap_or_default(),
@@ -285,9 +328,9 @@ fn rules_json() -> String {
         return json!({ "rules": [] }).to_string();
     };
     let mut groups: Vec<serde_json::Value> = Vec::new();
-    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
     for r in &cfg.rules {
-        let gi = *index.entry(r.pkg.as_str()).or_insert_with(|| {
+        let gi = *index.entry(r.pkg.clone()).or_insert_with(|| {
             groups.push(json!({ "pkg": r.pkg, "items": [] }));
             groups.len() - 1
         });
@@ -295,6 +338,21 @@ fn rules_json() -> String {
             .as_array_mut()
             .unwrap()
             .push(json!({ "thread": r.thread, "spec": spec_name(&r.cpus, &cfg.topo) }));
+    }
+    // 动态规则（按负载选举/阈值）与静态规则同组展示，spec 为可回写文本
+    for r in &cfg.dyn_rules {
+        let gi = *index.entry(r.pkg.clone()).or_insert_with(|| {
+            groups.push(json!({ "pkg": r.pkg, "items": [] }));
+            groups.len() - 1
+        });
+        groups[gi]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "thread": r.thread,
+                "spec": dyn_spec_str(&r.spec, &cfg.topo),
+                "dyn": true,
+            }));
     }
     json!({ "rules": groups }).to_string()
 }
@@ -333,9 +391,9 @@ fn rule_api(req: &Request) -> (u16, String) {
     if thread.is_empty() && !pkg_shape_ok(pkg) {
         return err_json(400, "包名含 { 且以 } 结尾时不支持包级规则，可改用线程规则");
     }
-    if cpus.is_empty() || cpus.len() >= 64 || !spec_like(cpus)
-        || parse_cpu_spec(cpus, &cfg.topo).count() == 0
-    {
+    let spec_ok = (spec_like(cpus) && parse_cpu_spec(cpus, &cfg.topo).count() != 0)
+        || dyn_spec_try(cpus, &cfg.topo).is_some();
+    if cpus.is_empty() || cpus.len() >= 128 || !spec_ok {
         return err_json(400, "无效的 CPU 规格");
     }
 
@@ -468,13 +526,24 @@ fn rank_top(counts: BTreeMap<String, usize>, lq: &str) -> Vec<(String, usize)> {
 }
 
 fn suggest_pkgs(q: &str) -> Vec<(String, usize)> {
-    let mut counts: BTreeMap<String, usize> =
-        installed_pkgs().into_iter().map(|p| (p, 0)).collect();
-    for_each_pid(|pid| {
-        if let Some(name) = read_cmdline(pid).filter(|n| n.contains('.')) {
-            *counts.entry(name).or_insert(0) += 1;
+    let counts: BTreeMap<String, usize> = {
+        let mut guard = lock_ignore_poison(&SUGGEST_PKG_CACHE);
+        if let Some((t, c)) = guard.as_ref()
+            && t.elapsed() < SUGGEST_TTL
+        {
+            c.clone()
+        } else {
+            let mut m: BTreeMap<String, usize> =
+                installed_pkgs().into_iter().map(|p| (p, 0)).collect();
+            for_each_pid(|pid| {
+                if let Some(name) = read_cmdline(pid).filter(|n| n.contains('.')) {
+                    *m.entry(name).or_insert(0) += 1;
+                }
+            });
+            *guard = Some((Instant::now(), m.clone()));
+            m
         }
-    });
+    };
     rank_top(counts, &q.to_ascii_lowercase())
 }
 
@@ -485,16 +554,30 @@ fn thread_comm(pid: i32, tid: i32) -> Option<String> {
 }
 
 fn suggest_threads(pkg: &str, q: &str) -> Vec<(String, usize)> {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for_each_pid(|pid| {
-        if read_cmdline(pid).as_deref() == Some(pkg) {
-            for tid in task_tids(pid).unwrap_or_default() {
-                if let Some(comm) = thread_comm(pid, tid) {
-                    *counts.entry(comm).or_insert(0) += 1;
+    let counts: BTreeMap<String, usize> = {
+        let mut guard = lock_ignore_poison(&SUGGEST_THREAD_CACHE);
+        if let Some((t, c)) = guard.get(pkg)
+            && t.elapsed() < SUGGEST_TTL
+        {
+            c.clone()
+        } else {
+            let mut m: BTreeMap<String, usize> = BTreeMap::new();
+            for_each_pid(|pid| {
+                if read_cmdline(pid).as_deref() == Some(pkg) {
+                    for tid in task_tids(pid).unwrap_or_default() {
+                        if let Some(comm) = thread_comm(pid, tid) {
+                            *m.entry(comm).or_insert(0) += 1;
+                        }
+                    }
                 }
+            });
+            guard.insert(pkg.to_string(), (Instant::now(), m.clone()));
+            if guard.len() > 16 {
+                guard.retain(|_, (t, _)| t.elapsed() < SUGGEST_TTL);
             }
+            m
         }
-    });
+    };
     rank_top(counts, &q.to_ascii_lowercase())
 }
 
@@ -546,7 +629,11 @@ fn config_set_api(req: &Request) -> (u16, String) {
         CHECK_INTERVAL.store(n, Ordering::Relaxed);
     }
     if let Some(n) = name {
+        let old = base_cpuset();
         crate::cpuset::set_base_cpuset(n);
+        if old != base_cpuset() {
+            crate::cpuset::remove_cpuset_dir(old.rsplit('/').next().unwrap_or_default());
+        }
         if let Some(cfg) = current_cfg()
             && cfg.topo.cpuset_enabled {
                 create_cpuset_dir(&base_cpuset(), &cfg.topo.present_str, &cfg.topo.mems_str);
@@ -554,8 +641,12 @@ fn config_set_api(req: &Request) -> (u16, String) {
         FORCE_RELOAD.store(true, Ordering::Release);
     }
     if let Some(p) = path {
-        if std::fs::metadata(p).is_err() {
-            let _ = std::fs::write(p, "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n");
+        match std::fs::metadata(p) {
+            Err(_) => {
+                let _ = std::fs::write(p, "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n");
+            }
+            Ok(m) if m.is_dir() => return err_json(400, "配置文件路径不能是目录"),
+            Ok(_) => {}
         }
         *lock_ignore_poison(&CONFIG_FILE) = p.to_string();
         FORCE_RELOAD.store(true, Ordering::Release);

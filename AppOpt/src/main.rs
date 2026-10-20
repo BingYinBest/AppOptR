@@ -6,6 +6,7 @@ mod apply_affinity;
 mod cache;
 mod config;
 mod cpuset;
+mod dynamic;
 mod ebpf_mode;
 mod proc_mode;
 mod rule_edit;
@@ -20,13 +21,16 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::config::{config_loader, init_inotify, load_config, CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG};
+use crate::config::{
+    config_loader, init_inotify, load_config, AppConfig, CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG,
+};
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
+use crate::dynamic::dyn_eval;
 use crate::ebpf_mode::{
     affinity_check, full_scan, event_dispatch, comm_map_init,
     ebpf_init, EbpfState,
 };
-use crate::proc_mode::{cache_sync, ProcScanState};
+use crate::proc_mode::{proc_diff, ProcScanState};
 use crate::web::{
     cache_stats, settings_load, settings_save, web_start, WebStats,
     WEB_ENABLED, WEB_STATS, MODE_FORCE, SETTINGS_FILE,
@@ -68,6 +72,7 @@ fn print_help(prog_name: &str) {
     println!("  # 注释以 # 或 // 开头");
     println!("  com.example=0-3           包级规则，绑定到 CPU 0-3");
     println!("  com.example=e-core        语义核心，绑定到全部小核");
+    println!("  com.example=m-core        语义核心，绑定到中频档（4 档及以上芯片的第二档）");
     println!("  com.example=p-core        语义核心，绑定到全部中核");
     println!("  com.example=hp-core       语义核心，绑定到全部大核");
     println!();
@@ -78,6 +83,192 @@ fn print_help(prog_name: &str) {
     println!("  }}");
     println!("  线程 RenderThread 绑定到 CPU 6-7");
     println!("  线程 Thread-1 绑定到 CPU 0-5");
+    println!();
+    println!("  动态规则（按负载自动选择）：");
+    println!("    Thread-*=elect(6-7 | 0-5)    组内负载最高线程绑 6-7，其余绑 0-5");
+    println!("    Thread-*=load(7 | 4-6 | 50)  单线程负载>50% 绑 7，否则绑 4-6");
+    println!("  动态规则优先于同包静态线程规则，档位切换带滞回防抖（5s 驻留）");
+}
+
+/// 主循环运行状态，收敛主循环内的全部局部状态
+struct LoopState {
+    config_handle: thread::JoinHandle<()>,
+    proc_state: Option<ProcScanState>,
+    ebpf_state: Option<EbpfState>,
+    affinity_deadline: Instant,
+    web_stats_deadline: Instant,
+    ebpf_retry_at: Instant,
+    /// 动态规则（按负载选举/阈值）周期评估
+    dyn_deadline: Instant,
+    /// eBPF 事件丢失兜底：周期全量对账（proc 模式有 60s reconcile，此处低频全扫）
+    ebpf_reconcile_deadline: Instant,
+    prog_start: Instant,
+}
+
+/// 配置加载线程 panic 恢复
+fn revive_config_loader(state: &mut LoopState) {
+    if state.config_handle.is_finished() {
+        eprintln!("警告: 配置加载线程异常退出，尝试重启...");
+        state.config_handle = thread::spawn(config_loader);
+    }
+}
+
+/// 强制 /proc 模式时卸载 eBPF 并触发全量扫描
+fn switch_to_proc_if_forced(state: &mut LoopState, mode: u8) {
+    if mode == 2 && state.ebpf_state.is_some() {
+        println!("工作模式切换: /proc 轮询");
+        state.ebpf_state = None;
+        let cache = state.proc_state.get_or_insert_with(ProcScanState::new);
+        cache.reset_scan();
+        state.affinity_deadline = Instant::now();
+    }
+}
+
+/// eBPF 缺失时周期重试，自动模式失败一次后放弃，强制模式持续重试
+fn try_ebpf_reinit(state: &mut LoopState, cfg: &AppConfig, mode: u8) {
+    if mode != 2
+        && state.ebpf_state.is_none()
+        && (mode == 1 || !EBPF_GAVE_UP.load(Ordering::Relaxed))
+        && state.ebpf_retry_at.elapsed() >= Duration::from_secs(30)
+    {
+        state.ebpf_retry_at = Instant::now();
+        if let Some(mut new_es) = ebpf_init() {
+            if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
+                eprintln!("eBPF: 白名单容量不足，保持 /proc 轮询");
+                if mode == 0 {
+                    EBPF_GAVE_UP.store(true, Ordering::Relaxed);
+                }
+            } else {
+                println!("工作模式切换: eBPF 事件驱动");
+                full_scan(cfg, &mut new_es);
+                state.ebpf_state = Some(new_es);
+                state.affinity_deadline = Instant::now();
+            }
+        } else if mode == 0 {
+            EBPF_GAVE_UP.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// 配置变更时刷新 eBPF 白名单，返回 true 表示需重建程序
+fn ebpf_reload_requested(state: &mut LoopState, cfg: &AppConfig, config_changed: bool) -> bool {
+    if let Some(es) = state.ebpf_state.as_mut()
+        && config_changed
+    {
+        // 容量不足时交由 rebuild_ebpf 重建（新程序会重新 full_scan），避免对将被丢弃的旧程序做无效扫描
+        if comm_map_init(&mut es.bpf, &cfg.pkgs, es.comm_capacity) {
+            true
+        } else {
+            full_scan(cfg, es);
+            false
+        }
+    } else {
+        false
+    }
+}
+
+/// 白名单容量不足时重建 eBPF 程序，失败回退 /proc
+fn rebuild_ebpf(state: &mut LoopState, cfg: &AppConfig) {
+    state.ebpf_state = None;
+    if let Some(mut new_es) = ebpf_init() {
+        if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
+            eprintln!("eBPF: 重载后白名单容量仍不足，回退到 /proc 轮询");
+            return;
+        }
+        full_scan(cfg, &mut new_es);
+        state.ebpf_state = Some(new_es);
+    }
+}
+
+/// eBPF 分支：事件派发与周期性 affinity_check，返回事件通道是否断开
+fn ebpf_event_step(
+    es: &mut EbpfState,
+    affinity_deadline: &mut Instant,
+    dyn_deadline: &mut Instant,
+    cfg: &AppConfig,
+    interval: u64,
+) -> bool {
+    let mut dead = false;
+    match es.event_rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(batch) => {
+            for event in &batch {
+                event_dispatch(event, cfg, es);
+            }
+            while let Ok(batch) = es.event_rx.try_recv() {
+                for event in &batch {
+                    event_dispatch(event, cfg, es);
+                }
+            }
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            dead = true;
+        }
+    }
+
+    if affinity_deadline.elapsed() >= Duration::from_secs(3 * interval) {
+        affinity_check(es, cfg);
+        *affinity_deadline = Instant::now();
+    }
+    if dyn_deadline.elapsed() >= Duration::from_secs(5 * interval) {
+        dyn_eval(cfg, &mut es.cache);
+        *dyn_deadline = Instant::now();
+    }
+    dead
+}
+
+/// /proc 分支：增量同步与周期性 affinity_sync
+fn proc_cycle(
+    cache: &mut ProcScanState,
+    affinity_deadline: &mut Instant,
+    dyn_deadline: &mut Instant,
+    cfg: &AppConfig,
+    interval: u64,
+    config_changed: bool,
+) {
+    if config_changed {
+        cache.reset_scan();
+    }
+    proc_diff(cfg, cache);
+    if affinity_deadline.elapsed() >= Duration::from_secs(5 * interval) || cache.force_affinity {
+        cache.cache.affinity_sync(&cfg.topo);
+        *affinity_deadline = Instant::now();
+        cache.force_affinity = false;
+    }
+    if dyn_deadline.elapsed() >= Duration::from_secs(5 * interval) {
+        dyn_eval(cfg, &mut cache.cache);
+        *dyn_deadline = Instant::now();
+    }
+    thread::sleep(Duration::from_secs(interval));
+}
+
+/// eBPF 事件通道断开后回退到 /proc 轮询
+fn fallback_to_proc(state: &mut LoopState) {
+    eprintln!("eBPF: 事件通道断开，回退到 /proc 轮询");
+    state.ebpf_state = None;
+    let cache = state.proc_state.get_or_insert_with(ProcScanState::new);
+    cache.reset_scan();
+    state.affinity_deadline = Instant::now();
+}
+
+/// web 状态统计，低频更新避免高频事件循环下的额外开销
+fn update_web_stats(state: &mut LoopState, cfg: &AppConfig) {
+    if WEB_ENABLED.load(Ordering::Relaxed) && state.web_stats_deadline.elapsed() >= Duration::from_secs(2) {
+        state.web_stats_deadline = Instant::now();
+        let (threads, hit_pkgs) = match (&state.ebpf_state, &state.proc_state) {
+            (Some(es), _) => cache_stats(&es.cache),
+            (None, Some(ps)) => cache_stats(&ps.cache),
+            _ => (0, 0),
+        };
+        *lock_ignore_poison(&WEB_STATS) = Some(WebStats {
+            rules: cfg.rules.len() + cfg.dyn_rules.len(),
+            pkgs: cfg.pkgs.len(),
+            hit_pkgs,
+            threads,
+            ebpf: state.ebpf_state.is_some(),
+            uptime: state.prog_start.elapsed().as_secs(),
+        });
+    }
 }
 
 fn main() {
@@ -162,8 +353,13 @@ fn main() {
     let st = settings_load(SETTINGS_FILE);
     let config_file = cli_cfg.unwrap_or(st.config_file);
     let sleep_interval = cli_interval.unwrap_or(st.check_interval);
-    let cpuset_name = cli_cpuset.unwrap_or(st.cpuset_name);
+    let cpuset_name = cli_cpuset.unwrap_or_else(|| st.cpuset_name.clone());
     let web_enable = cli_web || st.web_enable;
+
+    // 更换 cpuset 目录名时清除旧目录及其中的任务，避免残留
+    if cpuset_name != st.cpuset_name {
+        crate::cpuset::remove_cpuset_dir(&st.cpuset_name);
+    }
 
     // 先设置 cpuset 路径再初始化拓扑，init_cpu_topo 会创建 BASE_CPUSET 目录
     set_base_cpuset(&cpuset_name);
@@ -207,26 +403,32 @@ fn main() {
     }
 
     // 守护进程模式，保存 JoinHandle 用于 panic 恢复检测
-    let mut config_handle = thread::spawn(config_loader);
-
-    let mut proc_state: Option<ProcScanState> = None;
-    let mut affinity_deadline = Instant::now();
-    let prog_start = Instant::now();
-    let mut web_stats_deadline = Instant::now();
-    // 预支 60 秒使首次重试立即到期
-    let mut ebpf_retry_at = Instant::now()
-        .checked_sub(Duration::from_secs(60))
-        .unwrap_or_else(Instant::now);
+    let config_handle = thread::spawn(config_loader);
 
     println!("启动AppOpt服务 v{}", env!("CARGO_PKG_VERSION"));
 
     // 恢复的强制 proc 模式无需 eBPF 初始化
-    let mut ebpf_state: Option<EbpfState> =
+    let ebpf_state: Option<EbpfState> =
         if MODE_FORCE.load(Ordering::Relaxed) == 2 { None } else { ebpf_init() };
     // 仅自动模式失败一次即放弃；强制 eBPF 需持续重试，强制 proc 无需 eBPF
     if ebpf_state.is_none() && MODE_FORCE.load(Ordering::Relaxed) == 0 {
         EBPF_GAVE_UP.store(true, Ordering::Relaxed);
     }
+
+    let mut st = LoopState {
+        config_handle,
+        proc_state: None,
+        ebpf_state,
+        affinity_deadline: Instant::now(),
+        web_stats_deadline: Instant::now(),
+        // 预支 60 秒使首次重试立即到期
+        ebpf_retry_at: Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now),
+        dyn_deadline: Instant::now(),
+        ebpf_reconcile_deadline: Instant::now(),
+        prog_start: Instant::now(),
+    };
 
     loop {
         // 先 swap CONFIG_UPDATED 再获取 cfg 防止漏更新
@@ -238,137 +440,32 @@ fn main() {
         let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
         let mode = MODE_FORCE.load(Ordering::Relaxed);
 
-        // 配置加载线程 panic 恢复
-        if config_handle.is_finished() {
-            eprintln!("警告: 配置加载线程异常退出，尝试重启...");
-            config_handle = thread::spawn(config_loader);
-        }
+        revive_config_loader(&mut st);
+        switch_to_proc_if_forced(&mut st, mode);
+        try_ebpf_reinit(&mut st, &cfg, mode);
 
-        // 强制 /proc 时卸载 eBPF 并触发全量扫描
-        if mode == 2 && ebpf_state.is_some() {
-            println!("工作模式切换: /proc 轮询");
-            ebpf_state = None;
-            let cache = proc_state.get_or_insert_with(ProcScanState::new);
-            cache.scan_all_proc = true;
-            cache.last_proc_count = 0;
-            cache.force_affinity = true;
-            affinity_deadline = Instant::now();
-        }
-
-        // eBPF 缺失时周期重试，自动模式失败一次后放弃，强制模式持续重试
-        if mode != 2
-            && ebpf_state.is_none()
-            && (mode == 1 || !EBPF_GAVE_UP.load(Ordering::Relaxed))
-            && ebpf_retry_at.elapsed() >= Duration::from_secs(30)
-        {
-            ebpf_retry_at = Instant::now();
-            if let Some(mut new_es) = ebpf_init() {
-                if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
-                    eprintln!("eBPF: 白名单容量不足，保持 /proc 轮询");
-                    if mode == 0 {
-                        EBPF_GAVE_UP.store(true, Ordering::Relaxed);
-                    }
-                } else {
-                    println!("工作模式切换: eBPF 事件驱动");
-                    full_scan(&cfg, &mut new_es);
-                    ebpf_state = Some(new_es);
-                    affinity_deadline = Instant::now();
-                }
-            } else if mode == 0 {
-                EBPF_GAVE_UP.store(true, Ordering::Relaxed);
-            }
-        }
-
-        let mut ebpf_dead = false;
-
-        let need_reload = if let Some(es) = ebpf_state.as_mut() {
-            if config_changed {
-                let r = comm_map_init(&mut es.bpf, &cfg.pkgs, es.comm_capacity);
-                if !r {
-                    full_scan(&cfg, es);
-                }
-                r
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
+        let need_reload = ebpf_reload_requested(&mut st, &cfg, config_changed);
         if need_reload {
-            ebpf_state = None;
-            if let Some(mut new_es) = ebpf_init() {
-                if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
-                    eprintln!("eBPF: 重载后白名单容量仍不足，回退到 /proc 轮询");
-                    continue;
-                }
-                full_scan(&cfg, &mut new_es);
-                ebpf_state = Some(new_es);
-            }
+            rebuild_ebpf(&mut st, &cfg);
             continue;
         }
 
-        if let Some(es) = ebpf_state.as_mut() {
-            match es.event_rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(event) => {
-                    event_dispatch(&event, &cfg, es);
-                    while let Ok(event) = es.event_rx.try_recv() {
-                        event_dispatch(&event, &cfg, es);
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    ebpf_dead = true;
-                }
+        let ebpf_dead = if let Some(es) = st.ebpf_state.as_mut() {
+            if st.ebpf_reconcile_deadline.elapsed() >= Duration::from_secs(600) {
+                st.ebpf_reconcile_deadline = Instant::now();
+                full_scan(&cfg, es);
             }
-
-            if affinity_deadline.elapsed() >= Duration::from_secs(3 * interval) {
-                affinity_check(es, &cfg);
-                affinity_deadline = Instant::now();
-            }
+            ebpf_event_step(es, &mut st.affinity_deadline, &mut st.dyn_deadline, &cfg, interval)
         } else {
-            let cache = proc_state.get_or_insert_with(ProcScanState::new);
-            if config_changed {
-                cache.scan_all_proc = true;
-                cache.last_proc_count = 0;
-            }
-            cache_sync(cache, &cfg);
-            if affinity_deadline.elapsed() >= Duration::from_secs(5 * interval) || cache.force_affinity {
-                cache.cache.affinity_sync(&cfg.topo);
-                affinity_deadline = Instant::now();
-                cache.force_affinity = false;
-            }
-            thread::sleep(Duration::from_secs(interval));
-        }
+            let cache = st.proc_state.get_or_insert_with(ProcScanState::new);
+            proc_cycle(cache, &mut st.affinity_deadline, &mut st.dyn_deadline, &cfg, interval, config_changed);
+            false
+        };
 
         if ebpf_dead {
-            eprintln!("eBPF: 事件通道断开，回退到 /proc 轮询");
-            ebpf_state = None;
-            let cache = proc_state.get_or_insert_with(ProcScanState::new);
-            cache.scan_all_proc = true;
-            cache.last_proc_count = 0;
-            cache.force_affinity = true;
-            affinity_deadline = Instant::now();
+            fallback_to_proc(&mut st);
         }
 
-        // web 状态统计，低频更新避免高频事件循环下的额外开销
-        if WEB_ENABLED.load(Ordering::Relaxed)
-            && web_stats_deadline.elapsed() >= Duration::from_secs(2)
-        {
-            web_stats_deadline = Instant::now();
-            let (threads, hit_pkgs) = match (&ebpf_state, &proc_state) {
-                (Some(es), _) => cache_stats(&es.cache),
-                (None, Some(ps)) => cache_stats(&ps.cache),
-                _ => (0, 0),
-            };
-            *lock_ignore_poison(&WEB_STATS) = Some(WebStats {
-                rules: cfg.rules.len(),
-                pkgs: cfg.pkgs.len(),
-                hit_pkgs,
-                threads,
-                ebpf: ebpf_state.is_some(),
-                uptime: prog_start.elapsed().as_secs(),
-            });
-        }
+        update_web_stats(&mut st, &cfg);
     }
 }

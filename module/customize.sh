@@ -27,7 +27,7 @@ extract_bin() {
 	if [ "$ARCH" == "arm64" ]; then
 		cp $MODPATH/bin/arm64-v8a/AppOpt* $MODPATH
 	elif [ "$ARCH" == "x64" ]; then
-		cp $MODPATH/bin/x86_64/AppOpt -v $MODPATH
+		cp $MODPATH/bin/x86_64/AppOpt* $MODPATH
 	else
 		abort "! Unsupported platform: $ARCH"
 	fi
@@ -188,5 +188,7 @@ check_required_files
 copy_default_rules
 extract_bin
 module_instructions
-set_perm_recursive "$MODPATH" 0 0 0755 0644
-set_perm_recursive "$MODPATH/*.sh $MODPATH/AppOpt $MODPATH/AppOpt-ebpf" 0 2000 0755 0755 u:object_r:magisk_file:s0
+set_perm_recursive "$MODPATH" 0 0 0755 0644 u:object_r:magisk_file:s0
+set_perm "$MODPATH/AppOpt" 0 2000 0755 u:object_r:magisk_file:s0
+set_perm "$MODPATH/AppOpt-ebpf" 0 2000 0755 u:object_r:magisk_file:s0
+set_perm "$MODPATH/service.sh" 0 2000 0755 u:object_r:magisk_file:s0

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::io;
@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::{lock_ignore_poison, CONFIG_UPDATED, MAX_PKG_LEN, MAX_THREAD_LEN};
-use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology};
+use crate::cpuset::{parse_cpu_spec, CpuSet, CpuTopology};
 
 pub static INOTIFY_SUPPORTED: AtomicBool = AtomicBool::new(false);
 pub static INOTIFY_FD: AtomicI32 = AtomicI32::new(-1);
@@ -23,8 +23,50 @@ pub struct AffinityRule {
     pub pkg: String,
     pub thread: String,
     pub thread_pattern: CString,
-    pub cpuset_dir: String,
     pub cpus: CpuSet,
+}
+
+/// 动态规则规格：按负载选举最重线程，或按阈值升降档
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DynSpec {
+    /// 组内负载最高线程绑 winner，其余绑 others
+    Elect {
+        winner: Box<CpuSet>,
+        others: Box<CpuSet>,
+    },
+    /// 单线程负载 > threshold% 绑 high，否则绑 low
+    Load {
+        high: Box<CpuSet>,
+        low: Box<CpuSet>,
+        threshold: u32,
+    },
+}
+
+impl DynSpec {
+    pub fn tier_cpus(&self, tier: u8) -> CpuSet {
+        match self {
+            DynSpec::Elect { winner, others } => {
+                if tier == 0 { **winner } else { **others }
+            }
+            DynSpec::Load { high, low, .. } => {
+                if tier == 0 { **high } else { **low }
+            }
+        }
+    }
+}
+
+pub struct DynRule {
+    pub pkg: String,
+    pub thread: String,
+    pub thread_pattern: CString,
+    pub spec: DynSpec,
+}
+
+/// 解析产出的规则条目，动态规则与静态规则分开构建
+#[derive(Debug, PartialEq)]
+pub enum ParsedRule {
+    Static { pkg: String, thread: String, cpus: String },
+    Dyn { pkg: String, thread: String, spec: DynSpec },
 }
 
 pub struct AppConfig {
@@ -32,6 +74,17 @@ pub struct AppConfig {
     pub pkgs: HashSet<String>,
     pub has_thread_rules: HashSet<String>,
     pub topo: CpuTopology,
+    /// pkg → 该包规则下标，绑定路径避免全量规则扫描
+    pub rules_by_pkg: HashMap<String, Vec<usize>>,
+    /// pkg → 线程名 → 无 fnmatch 元字符的规则下标，精确线程名 O(1) 命中
+    pub exact_thread_rules: HashMap<String, HashMap<String, Vec<usize>>>,
+    /// 动态规则（按负载选举/阈值），优先于同包静态线程规则
+    pub dyn_rules: Vec<DynRule>,
+    /// pkg → 动态规则下标
+    pub dyn_by_pkg: HashMap<String, Vec<usize>>,
+    pub has_dyn_rules: HashSet<String>,
+    /// 已确认存在的 cpuset 子目录名，避免重复创建的系统调用
+    pub cpuset_dirs: Mutex<HashSet<String>>,
 }
 
 pub static CURRENT_CONFIG: Mutex<Option<Arc<AppConfig>>> = Mutex::new(None);
@@ -47,7 +100,7 @@ pub fn spec_like(s: &str) -> bool {
             continue;
         }
         any = true;
-        let ok = matches!(t, "e-core" | "p-core" | "hp-core" | "all-core")
+        let ok = matches!(t, "e-core" | "m-core" | "p-core" | "hp-core" | "all-core")
             || t.bytes().all(|b| b.is_ascii_digit())
             || t.split_once('-').is_some_and(|(a, b)| {
                 !a.is_empty()
@@ -60,6 +113,11 @@ pub fn spec_like(s: &str) -> bool {
         }
     }
     any
+}
+
+/// fnmatch 模式是否含通配元字符（FNM_NOESCAPE 下 \\ 为字面量，无需转义处理）
+pub fn pattern_has_meta(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[')
 }
 
 pub fn comment_at(s: &str) -> Option<usize> {
@@ -166,48 +224,92 @@ fn add_rule(
     if set.count() == 0 {
         return false;
     }
-    let cpuset_dir = if thread.is_empty() {
-        let dir_name = set.to_range_string();
-        if topo.cpuset_enabled {
-            let path = format!("{}/{}", base_cpuset(), dir_name);
-            if create_cpuset_dir(&path, &dir_name, &topo.mems_str) { dir_name } else { Default::default() }
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
     rules.push(AffinityRule {
         pkg: pkg.to_string(),
         thread: thread.to_string(),
         thread_pattern: CString::new(thread).unwrap_or_default(),
-        cpuset_dir,
         cpus: set,
     });
     true
 }
 
-/// 加载配置文件，返回 None 表示未变化或解析失败
-pub fn load_config(
-    config_file: &str,
-    topo: &CpuTopology,
-    last_mtime: &mut i64,
-) -> Option<AppConfig> {
-    let metadata = fs::metadata(config_file).ok()?;
-    let mtime = metadata
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos() as i64;
+/// 解析动态规则规格（elect(a|b) / load(a|b|n)），非动态形态返回 None
+pub fn dyn_spec_try(cpus: &str, topo: &CpuTopology) -> Option<DynSpec> {
+    let s = cpus.trim();
+    if let Some(inner) = s.strip_prefix("elect(").and_then(|r| r.strip_suffix(')')) {
+        let mut parts = inner.split('|').map(str::trim).filter(|p| !p.is_empty());
+        let a = parts.next()?;
+        let b = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        let winner = parse_cpu_spec(a, topo);
+        let others = parse_cpu_spec(b, topo);
+        if winner.count() == 0 || others.count() == 0 {
+            return None;
+        }
+        return Some(DynSpec::Elect {
+            winner: Box::new(winner),
+            others: Box::new(others),
+        });
+    }
+    if let Some(inner) = s.strip_prefix("load(").and_then(|r| r.strip_suffix(')')) {
+        let mut parts = inner.split('|').map(str::trim).filter(|p| !p.is_empty());
+        let a = parts.next()?;
+        let b = parts.next()?;
+        let t = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        let threshold: u32 = t.parse().ok().filter(|n| (1..=100).contains(n))?;
+        let high = parse_cpu_spec(a, topo);
+        let low = parse_cpu_spec(b, topo);
+        if high.count() == 0 || low.count() == 0 {
+            return None;
+        }
+        return Some(DynSpec::Load {
+            high: Box::new(high),
+            low: Box::new(low),
+            threshold,
+        });
+    }
+    None
+}
 
-    if *last_mtime == mtime && *last_mtime != -1 {
+/// 校验并解析单条规则，动态形态走 Dyn 分支，静态形态走 Static 分支（纯函数，不触碰文件系统）
+fn parse_rule_entry(
+    pkg: &str,
+    thread: &str,
+    cpus: &str,
+    topo: &CpuTopology,
+) -> Option<ParsedRule> {
+    if pkg.is_empty()
+        || pkg.len() >= MAX_PKG_LEN
+        || thread.len() >= MAX_THREAD_LEN
+        || pkg.bytes().chain(thread.bytes()).any(|b| b < 0x20 || b == 0x7f)
+    {
         return None;
     }
+    if let Some(spec) = dyn_spec_try(cpus, topo) {
+        return Some(ParsedRule::Dyn {
+            pkg: pkg.to_string(),
+            thread: thread.to_string(),
+            spec,
+        });
+    }
+    if !spec_like(cpus) || parse_cpu_spec(cpus, topo).count() == 0 {
+        return None;
+    }
+    Some(ParsedRule::Static {
+        pkg: pkg.to_string(),
+        thread: thread.to_string(),
+        cpus: cpus.to_string(),
+    })
+}
 
-    let content = fs::read_to_string(config_file).ok()?;
-
-    let mut rules: Vec<AffinityRule> = Vec::new();
+/// 解析配置文本为有效规则条目（静态 + 动态）与失败计数
+fn parse_rules(content: &str, topo: &CpuTopology) -> (Vec<ParsedRule>, usize) {
+    let mut rules: Vec<ParsedRule> = Vec::new();
     let mut fail_cnt: usize = 0;
     let mut cur_pkg = String::new();
     let mut pending_pkg = String::new();
@@ -227,8 +329,9 @@ pub fn load_config(
             }
             match split_rule_line(p) {
                 Some((thread, cpus, closed)) => {
-                    if !add_rule(&mut rules, topo, &cur_pkg, thread, cpus) {
-                        fail_cnt += 1;
+                    match parse_rule_entry(&cur_pkg, thread, cpus, topo) {
+                        Some(r) => rules.push(r),
+                        None => fail_cnt += 1,
                     }
                     if closed {
                         in_block = false;
@@ -252,8 +355,9 @@ pub fn load_config(
                     fail_cnt += 1;
                 }
                 pending_pkg.clear();
-                if !add_rule(&mut rules, topo, pkg, thread, cpus) {
-                    fail_cnt += 1;
+                match parse_rule_entry(pkg, thread, cpus, topo) {
+                    Some(r) => rules.push(r),
+                    None => fail_cnt += 1,
                 }
                 if open {
                     cur_pkg = pkg.to_string();
@@ -264,8 +368,9 @@ pub fn load_config(
                 if !pending_pkg.is_empty() {
                     fail_cnt += 1;
                 }
-                if !add_rule(&mut rules, topo, pkg, "", cpus) {
-                    fail_cnt += 1;
+                match parse_rule_entry(pkg, "", cpus, topo) {
+                    Some(r) => rules.push(r),
+                    None => fail_cnt += 1,
                 }
                 if open {
                     cur_pkg = pkg.to_string();
@@ -307,16 +412,76 @@ pub fn load_config(
         fail_cnt += 1;
     }
 
+    (rules, fail_cnt)
+}
+
+/// 加载配置文件，返回 None 表示未变化或解析失败
+pub fn load_config(
+    config_file: &str,
+    topo: &CpuTopology,
+    last_mtime: &mut i64,
+) -> Option<AppConfig> {
+    let metadata = fs::metadata(config_file).ok()?;
+    let mtime = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as i64;
+
+    if *last_mtime == mtime && *last_mtime != -1 {
+        return None;
+    }
+
+    let content = fs::read_to_string(config_file).ok()?;
+
+    let (parsed, fail_cnt) = parse_rules(&content, topo);
+
+    let mut rules: Vec<AffinityRule> = Vec::new();
+    let mut dyn_rules: Vec<DynRule> = Vec::new();
+    for parsed in parsed {
+        match parsed {
+            ParsedRule::Static { pkg, thread, cpus } => {
+                add_rule(&mut rules, topo, &pkg, &thread, &cpus);
+            }
+            ParsedRule::Dyn { pkg, thread, spec } => dyn_rules.push(DynRule {
+                thread_pattern: CString::new(thread.as_str()).unwrap_or_default(),
+                pkg,
+                thread,
+                spec,
+            }),
+        }
+    }
+
     *last_mtime = mtime;
     PARSE_FAILS.store(fail_cnt, Ordering::Relaxed);
 
-    let pkgs: HashSet<String> = rules.iter().map(|r| r.pkg.clone()).collect();
+    let mut pkgs: HashSet<String> = rules.iter().map(|r| r.pkg.clone()).collect();
+    pkgs.extend(dyn_rules.iter().map(|r| r.pkg.clone()));
     let has_thread_rules: HashSet<String> = rules
         .iter()
         .filter(|r| !r.thread.is_empty())
         .map(|r| r.pkg.clone())
         .collect();
-    let num_rules = rules.len();
+    let has_dyn_rules: HashSet<String> = dyn_rules.iter().map(|r| r.pkg.clone()).collect();
+    let mut rules_by_pkg: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut exact_thread_rules: HashMap<String, HashMap<String, Vec<usize>>> = HashMap::new();
+    for (i, r) in rules.iter().enumerate() {
+        rules_by_pkg.entry(r.pkg.clone()).or_default().push(i);
+        if !r.thread.is_empty() && !pattern_has_meta(&r.thread) {
+            exact_thread_rules
+                .entry(r.pkg.clone())
+                .or_default()
+                .entry(r.thread.clone())
+                .or_default()
+                .push(i);
+        }
+    }
+    let mut dyn_by_pkg: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, r) in dyn_rules.iter().enumerate() {
+        dyn_by_pkg.entry(r.pkg.clone()).or_default().push(i);
+    }
+    let num_rules = rules.len() + dyn_rules.len();
 
     println!("配置文件解析完成，共加载 {} 条规则", num_rules);
     if fail_cnt > 0 {
@@ -328,6 +493,12 @@ pub fn load_config(
         pkgs,
         has_thread_rules,
         topo: topo.clone(),
+        rules_by_pkg,
+        exact_thread_rules,
+        dyn_rules,
+        dyn_by_pkg,
+        has_dyn_rules,
+        cpuset_dirs: Mutex::new(HashSet::new()),
     })
 }
 
@@ -430,7 +601,8 @@ fn inotify_handle(interval: u64, last_mtime: &mut i64) {
         revents: 0,
     };
 
-    let ret = unsafe { libc::poll(&mut pfd, 1, (interval as libc::c_int) * 1000) };
+    let timeout_ms = interval.min(10) as libc::c_int * 1000;
+    let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
 
     if ret < 0 {
         let err = io::Error::last_os_error();
@@ -501,7 +673,7 @@ fn inotify_handle(interval: u64, last_mtime: &mut i64) {
 fn inotify_rewatch(inotify_fd: i32) -> bool {
     let inotify_wd = INOTIFY_WD.load(Ordering::Acquire);
     unsafe {
-        libc::inotify_rm_watch(inotify_fd, inotify_wd as u32);
+        libc::inotify_rm_watch(inotify_fd, inotify_wd as _);
     }
     let cfg_cstr = match CString::new(lock_ignore_poison(&CONFIG_FILE).clone()) {
         Ok(c) => c,
@@ -526,3 +698,310 @@ fn inotify_rewatch(inotify_fd: i32) -> bool {
     INOTIFY_WD.store(new_wd, Ordering::Release);
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sr(pkg: &str, thread: &str, cpus: &str) -> ParsedRule {
+        ParsedRule::Static {
+            pkg: pkg.to_string(),
+            thread: thread.to_string(),
+            cpus: cpus.to_string(),
+        }
+    }
+
+    #[test]
+    fn spec_like_accepts() {
+        assert!(spec_like("e-core"));
+        assert!(spec_like("p-core,hp-core"));
+        assert!(spec_like("m-core,p-core"));
+        assert!(spec_like("all-core"));
+        assert!(spec_like("0-3"));
+        assert!(spec_like("0-1,5-6"));
+        assert!(spec_like("3"));
+    }
+
+    #[test]
+    fn spec_like_rejects() {
+        assert!(!spec_like(""));
+        assert!(!spec_like(","));
+        assert!(!spec_like("0-"));
+        assert!(!spec_like("-3"));
+        assert!(!spec_like("abc"));
+        assert!(!spec_like("0-3,e-core,e"));
+    }
+
+    #[test]
+    fn comment_requires_preceding_whitespace() {
+        assert_eq!(comment_at("abc # def"), Some(3));
+        assert_eq!(comment_at("abc // def"), Some(3));
+        assert_eq!(comment_at("abc#def"), None);
+        assert_eq!(comment_at("abc//def"), None);
+        assert_eq!(comment_at("a\t#b"), Some(1));
+        assert_eq!(comment_at("no comment"), None);
+    }
+
+    #[test]
+    fn strip_comment_trims() {
+        assert_eq!(strip_comment("com.a=0-3  # 注释"), "com.a=0-3");
+        assert_eq!(strip_comment("com.a=0-3 // 注释"), "com.a=0-3");
+        assert_eq!(strip_comment("com.a=0-3"), "com.a=0-3");
+    }
+
+    #[test]
+    fn split_rule_line_kv() {
+        assert_eq!(split_rule_line("RenderThread=6-7"), Some(("RenderThread", "6-7", false)));
+        assert_eq!(split_rule_line("RenderThread=6-7}"), Some(("RenderThread", "6-7", true)));
+        assert_eq!(split_rule_line(" =x"), None);
+        assert_eq!(split_rule_line("x="), Some(("x", "", false)));
+    }
+
+    #[test]
+    fn close_like_variants() {
+        assert!(close_like("}"));
+        assert!(close_like("} "));
+        assert!(close_like("} # comment"));
+        assert!(!close_like("}x"));
+        assert!(!close_like("abc}"));
+    }
+
+    #[test]
+    fn split_single_line_forms() {
+        // 真实可解析形态：} 位于 = 之前
+        assert_eq!(
+            split_single_line("com.example{Render}=6-7}"),
+            Some(("com.example", "Render", "6-7}"))
+        );
+        // 常规内联写法 } 在 = 之后，不进入该分支
+        assert_eq!(split_single_line("com.example{RenderThread=6-7}"), None);
+        assert_eq!(split_single_line("com.example=0-3"), None);
+        assert_eq!(split_single_line("com.example{RenderThread=6-7"), None);
+    }
+
+    #[test]
+    fn parse_outer_rule() {
+        assert!(matches!(
+            parse_outer("com.example=0-3"),
+            OuterLine::Rule { pkg: "com.example", cpus: "0-3", open: false }
+        ));
+        assert!(matches!(
+            parse_outer("com.example=0-3 {"),
+            OuterLine::Rule { pkg: "com.example", cpus: "0-3", open: true }
+        ));
+    }
+
+    #[test]
+    fn parse_outer_bare_open() {
+        assert!(matches!(
+            parse_outer("com.example {"),
+            OuterLine::BareOpen { pkg: "com.example" }
+        ));
+    }
+
+    #[test]
+    fn parse_outer_pending() {
+        assert!(matches!(
+            parse_outer("com.example"),
+            OuterLine::Pending { pkg: "com.example" }
+        ));
+    }
+
+    #[test]
+    fn parse_outer_single_line() {
+        assert!(matches!(
+            parse_outer("com.example{Render}=6-7}"),
+            OuterLine::Single { pkg: "com.example", thread: "Render", cpus: "6-7}", open: false }
+        ));
+        // 常规内联写法 } 在 = 之后时退化为 Rule 分支
+        assert!(matches!(
+            parse_outer("com.example{RenderThread=6-7}"),
+            OuterLine::Rule { pkg: "com.example{RenderThread", cpus: "6-7}", open: false }
+        ));
+    }
+
+    #[test]
+    fn parse_outer_junk() {
+        assert!(matches!(parse_outer("}"), OuterLine::Junk));
+        assert!(matches!(parse_outer("} # x"), OuterLine::Junk));
+        assert!(matches!(parse_outer("} // 注释"), OuterLine::Junk));
+    }
+
+    fn test_topo() -> CpuTopology {
+        let mut present = CpuSet::new();
+        for c in 0..8 {
+            present.set(c);
+        }
+        let mut e = CpuSet::new();
+        e.set(0);
+        e.set(1);
+        let mut p = CpuSet::new();
+        p.set(2);
+        p.set(3);
+        let mut hp = CpuSet::new();
+        hp.set(4);
+        hp.set(5);
+        hp.set(6);
+        hp.set(7);
+        CpuTopology {
+            present_cpus: present,
+            present_str: "0-7".to_string(),
+            mems_str: "0".to_string(),
+            cpuset_enabled: false,
+            e_core: e,
+            m_core: CpuSet::new(),
+            p_core: p,
+            hp_core: hp,
+        }
+    }
+
+    #[test]
+    fn parse_rules_basic_kv() {
+        let (rules, fails) = parse_rules("com.a=0-3\ncom.b=hp-core\n", &test_topo());
+        assert_eq!(fails, 0);
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0], sr("com.a", "", "0-3"));
+        assert_eq!(rules[1], sr("com.b", "", "hp-core"));
+    }
+
+    #[test]
+    fn parse_rules_block_and_threads() {
+        let content = "\ncom.a=e-core,p-core {\n    RenderThread=hp-core\n    Thread-1=0-5\n}\ncom.b {\n    RenderThread=2\n}\n";
+        let (rules, fails) = parse_rules(content, &test_topo());
+        assert_eq!(fails, 0);
+        assert_eq!(rules.len(), 4);
+        assert_eq!(rules[0], sr("com.a", "", "e-core,p-core"));
+        assert_eq!(rules[1], sr("com.a", "RenderThread", "hp-core"));
+        assert_eq!(rules[2], sr("com.a", "Thread-1", "0-5"));
+        assert_eq!(rules[3], sr("com.b", "RenderThread", "2"));
+    }
+
+    #[test]
+    fn parse_rules_pending_block() {
+        let content = "com.a {\n    Render=6-7\n}\ncom.b\n";
+        let (rules, fails) = parse_rules(content, &test_topo());
+        assert_eq!(fails, 1);
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn parse_rules_comments_ignored() {
+        let content = "# 注释\n// 注释\n\ncom.a=0-1\n";
+        let (rules, fails) = parse_rules(content, &test_topo());
+        assert_eq!(fails, 0);
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn parse_rules_invalid_skipped() {
+        let content = "com.a=x\ncom.b=0-1\ncom.c=\n=5\nx{y=z}\n";
+        let (rules, fails) = parse_rules(content, &test_topo());
+        assert_eq!(rules.len(), 1);
+        assert!(matches!(rules[0], ParsedRule::Static { .. }));
+        assert!(fails >= 3);
+    }
+
+    #[test]
+    fn parse_rules_unclosed_block() {
+        let (rules, fails) = parse_rules("com.a {\n    Render=2\n", &test_topo());
+        assert_eq!(rules.len(), 1);
+        assert_eq!(fails, 1);
+    }
+
+    #[test]
+    fn parse_rules_open_rule_block() {
+        let content = "com.a=0-3 {\n    Render=4\n}\n";
+        let (rules, fails) = parse_rules(content, &test_topo());
+        assert_eq!(fails, 0);
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0], sr("com.a", "", "0-3"));
+        assert_eq!(rules[1], sr("com.a", "Render", "4"));
+    }
+
+    #[test]
+    fn parse_rules_thread_too_long_fails() {
+        let long = "x".repeat(40);
+        let content = format!("com.a={}\ncom.b=0-1\n", long);
+        let (rules, fails) = parse_rules(&content, &test_topo());
+        assert_eq!(rules.len(), 1);
+        assert_eq!(fails, 1);
+    }
+
+    #[test]
+    fn parse_rules_real_sample() {
+        let content = include_str!("../../module/applist.conf");
+        let (rules, fails) = parse_rules(content, &test_topo());
+        assert_eq!(fails, 0);
+        assert!(!rules.is_empty());
+        assert!(rules.iter().any(|r| matches!(
+            r,
+            ParsedRule::Static { pkg, thread, .. } if pkg == "com.tencent.mm" && thread.is_empty()
+        )));
+        assert!(rules.iter().any(|r| matches!(
+            r,
+            ParsedRule::Static { pkg, thread, .. } if pkg == "com.tencent.mm" && thread == "RenderThread"
+        )));
+        assert!(rules.iter().any(|r| matches!(
+            r,
+            ParsedRule::Static { pkg, thread, .. } if pkg == "com.tencent.mm:push" && thread.is_empty()
+        )));
+        assert!(rules.iter().any(|r| matches!(
+            r,
+            ParsedRule::Static { pkg, thread, .. } if pkg == "com.coolapk.market" && thread == "RenderThread"
+        )));
+    }
+
+    #[test]
+    fn parse_rules_dyn_elect() {
+        let content = "com.a {\n    Thread-*=elect(6-7 | 0-5)\n}\n";
+        let (rules, fails) = parse_rules(content, &test_topo());
+        assert_eq!(fails, 0);
+        assert_eq!(rules.len(), 1);
+        match &rules[0] {
+            ParsedRule::Dyn { pkg, thread, spec } => {
+                assert_eq!(pkg, "com.a");
+                assert_eq!(thread, "Thread-*");
+                match spec {
+                    DynSpec::Elect { winner, others } => {
+                        assert_eq!(winner.to_range_string(), "6-7");
+                        assert_eq!(others.to_range_string(), "0-5");
+                    }
+                    _ => panic!("应为 Elect 规格"),
+                }
+            }
+            _ => panic!("应为动态规则"),
+        }
+    }
+
+    #[test]
+    fn parse_rules_dyn_load() {
+        let content = "com.a {\n    Thread-*=load(7 | 4-6 | 50)\n}\n";
+        let (rules, fails) = parse_rules(content, &test_topo());
+        assert_eq!(fails, 0);
+        assert_eq!(rules.len(), 1);
+        match &rules[0] {
+            ParsedRule::Dyn { pkg, thread, spec } => {
+                assert_eq!(pkg, "com.a");
+                assert_eq!(thread, "Thread-*");
+                match spec {
+                    DynSpec::Load { high, low, threshold } => {
+                        assert_eq!(high.to_range_string(), "7");
+                        assert_eq!(low.to_range_string(), "4-6");
+                        assert_eq!(*threshold, 50);
+                    }
+                    _ => panic!("应为 Load 规格"),
+                }
+            }
+            _ => panic!("应为动态规则"),
+        }
+    }
+
+    #[test]
+    fn parse_rules_dyn_invalid() {
+        let content = "com.a {\n    T=elect(6-7)\n    U=load(7|4-6|0)\n    V=elect(6-7|0-5\n    W=load(7|4-6|101)\n}\n";
+        let (rules, fails) = parse_rules(content, &test_topo());
+        assert_eq!(rules.len(), 0);
+        assert!(fails >= 4);
+    }
+}
+

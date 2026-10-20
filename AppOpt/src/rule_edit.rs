@@ -5,6 +5,7 @@ use std::sync::Mutex;
 
 use crate::config::{close_like, comment_at, parse_outer, split_rule_line, split_single_line, strip_comment, OuterLine};
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum RuleEdit {
     Ok,
     NotFound,
@@ -249,9 +250,13 @@ fn spec_swap(raw: &str, cpus: &str) -> String {
     let rhs = &raw[eq + 1..cut];
     let val = rhs.trim_start();
     let lead = rhs.len() - val.len();
-    let v_end = val
-        .find(|c: char| c.is_whitespace() || c == '{' || c == '}')
-        .unwrap_or(val.len());
+    // 动态规则（elect(...)/load(...)）整体替换到闭合括号，避免内部空格截断
+    let v_end = if val.starts_with("elect(") || val.starts_with("load(") {
+        val.find(')').map(|p| p + 1).unwrap_or(val.len())
+    } else {
+        val.find(|c: char| c.is_whitespace() || c == '{' || c == '}')
+            .unwrap_or(val.len())
+    };
     let tail: String = val[v_end..]
         .chars()
         .filter(|c| c.is_whitespace() || *c == '{' || *c == '}')
@@ -460,4 +465,178 @@ pub fn rule_rename(path: &str, old: &str, new: &str) -> RuleEdit {
         }
     }
     file_write(path, &lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_file(tag: &str) -> String {
+        let mut path = std::env::temp_dir();
+        path.push(format!("appopt_rt_{}_{}.conf", std::process::id(), tag));
+        let _ = fs::remove_file(&path);
+        path.to_string_lossy().into_owned()
+    }
+
+    fn cleanup(f: &str) {
+        let _ = fs::remove_file(f);
+        let _ = fs::remove_file(format!("{}.tmp", f));
+    }
+
+    #[test]
+    fn upsert_new_pkg_rule() {
+        let f = tmp_file("newpkg");
+        assert_eq!(rule_upsert(&f, "com.a", "", "0-3"), RuleEdit::Ok);
+        assert_eq!(fs::read_to_string(&f).unwrap(), "com.a=0-3\n");
+        cleanup(&f);
+    }
+
+    #[test]
+    fn upsert_existing_pkg_rule_swaps_spec() {
+        let f = tmp_file("swap");
+        fs::write(&f, "com.a=0-3\n").unwrap();
+        assert_eq!(rule_upsert(&f, "com.a", "", "4-5"), RuleEdit::Ok);
+        assert_eq!(fs::read_to_string(&f).unwrap(), "com.a=4-5\n");
+        cleanup(&f);
+    }
+
+    #[test]
+    fn upsert_thread_rule_into_existing_block() {
+        let f = tmp_file("blk");
+        fs::write(&f, "com.a {\n\tX=0\n}\n").unwrap();
+        assert_eq!(rule_upsert(&f, "com.a", "Y", "1"), RuleEdit::Ok);
+        let out = fs::read_to_string(&f).unwrap();
+        assert!(out.contains("\tY=1\n"));
+        assert!(out.contains("\tX=0\n"));
+        cleanup(&f);
+    }
+
+    #[test]
+    fn upsert_thread_rule_into_open_inline() {
+        let f = tmp_file("oip");
+        fs::write(&f, "com.a=0-3 {\n\tX=0\n}\n").unwrap();
+        assert_eq!(rule_upsert(&f, "com.a", "Y", "2"), RuleEdit::Ok);
+        let out = fs::read_to_string(&f).unwrap();
+        assert!(out.contains("\tY=2\n"));
+        assert!(out.contains("com.a=0-3 {"));
+        cleanup(&f);
+    }
+
+    #[test]
+    fn upsert_thread_rule_converts_standalone() {
+        let f = tmp_file("stand");
+        fs::write(&f, "com.a=0-3\n").unwrap();
+        assert_eq!(rule_upsert(&f, "com.a", "Render", "4"), RuleEdit::Ok);
+        let out = fs::read_to_string(&f).unwrap();
+        assert!(out.starts_with("com.a=0-3 {"));
+        assert!(out.contains("\tRender=4\n"));
+        assert!(out.ends_with("}\n"));
+        cleanup(&f);
+    }
+
+    #[test]
+    fn upsert_thread_rule_new_block() {
+        let f = tmp_file("newblk");
+        assert_eq!(rule_upsert(&f, "com.b", "Render", "2"), RuleEdit::Ok);
+        let out = fs::read_to_string(&f).unwrap();
+        assert!(out.contains("com.b {"));
+        assert!(out.contains("\tRender=2\n"));
+        assert!(out.contains("}\n"));
+        cleanup(&f);
+    }
+
+    #[test]
+    fn upsert_dyn_rule_whole_swap() {
+        let f = tmp_file("dyn");
+        fs::write(&f, "com.a {\n\tThread-*=load(7 | 4-6 | 50)\n}\n").unwrap();
+        assert_eq!(rule_upsert(&f, "com.a", "Thread-*", "9"), RuleEdit::Ok);
+        let out = fs::read_to_string(&f).unwrap();
+        assert!(out.contains("\tThread-*=9\n"), "动态规则应整体替换不残留内部片段");
+        cleanup(&f);
+    }
+
+    #[test]
+    fn upsert_thread_rules_dedup_last_wins() {
+        let f = tmp_file("dup");
+        fs::write(&f, "com.a {\n\tX=0\n\tX=1\n}\n").unwrap();
+        assert_eq!(rule_upsert(&f, "com.a", "X", "9"), RuleEdit::Ok);
+        let out = fs::read_to_string(&f).unwrap();
+        assert_eq!(out.matches("\tX=9\n").count(), 1);
+        assert!(!out.contains("\tX=0\n"));
+        assert!(!out.contains("\tX=1\n"));
+        cleanup(&f);
+    }
+
+    #[test]
+    fn upsert_preserves_comments() {
+        let f = tmp_file("cmt");
+        fs::write(&f, "# 头部注释\ncom.a=0-3\n").unwrap();
+        assert_eq!(rule_upsert(&f, "com.a", "", "6"), RuleEdit::Ok);
+        let out = fs::read_to_string(&f).unwrap();
+        assert!(out.contains("# 头部注释"));
+        assert!(out.contains("com.a=6\n"));
+        cleanup(&f);
+    }
+
+    #[test]
+    fn delete_pkg_rule() {
+        let f = tmp_file("delpkg");
+        fs::write(&f, "com.a=0-3\ncom.b=1\n").unwrap();
+        assert_eq!(rule_delete(&f, "com.a", ""), RuleEdit::Ok);
+        assert_eq!(fs::read_to_string(&f).unwrap(), "com.b=1\n");
+        cleanup(&f);
+    }
+
+    #[test]
+    fn delete_thread_rule_keeps_block() {
+        let f = tmp_file("delt");
+        fs::write(&f, "com.a {\n\tX=0\n\tY=1\n}\n").unwrap();
+        assert_eq!(rule_delete(&f, "com.a", "X"), RuleEdit::Ok);
+        let out = fs::read_to_string(&f).unwrap();
+        assert!(!out.contains("X=0"));
+        assert!(out.contains("\tY=1\n"));
+        cleanup(&f);
+    }
+
+    #[test]
+    fn delete_pkg_entire_block() {
+        let f = tmp_file("delblk");
+        fs::write(&f, "com.a {\n\tX=0\n}\ncom.b=2\n").unwrap();
+        assert_eq!(rule_delete_pkg(&f, "com.a"), RuleEdit::Ok);
+        assert_eq!(fs::read_to_string(&f).unwrap(), "com.b=2\n");
+        cleanup(&f);
+    }
+
+    #[test]
+    fn delete_not_found() {
+        let f = tmp_file("nf");
+        fs::write(&f, "com.a=0\n").unwrap();
+        assert_eq!(rule_delete(&f, "com.zzz", ""), RuleEdit::NotFound);
+        cleanup(&f);
+    }
+
+    #[test]
+    fn rename_pkg() {
+        let f = tmp_file("ren");
+        fs::write(&f, "com.a=0-3\n").unwrap();
+        assert_eq!(rule_rename(&f, "com.a", "com.new"), RuleEdit::Ok);
+        assert_eq!(fs::read_to_string(&f).unwrap(), "com.new=0-3\n");
+        cleanup(&f);
+    }
+
+    #[test]
+    fn rename_into_existing_conflicts() {
+        let f = tmp_file("conf");
+        fs::write(&f, "com.a=0\ncom.b=1\n").unwrap();
+        assert_eq!(rule_rename(&f, "com.a", "com.b"), RuleEdit::Conflict);
+        cleanup(&f);
+    }
+
+    #[test]
+    fn upsert_unclosed_block_malformed() {
+        let f = tmp_file("mal");
+        fs::write(&f, "com.a {\n\tX=0\n").unwrap();
+        assert_eq!(rule_upsert(&f, "com.b", "", "1"), RuleEdit::Malformed);
+        cleanup(&f);
+    }
 }

@@ -204,6 +204,7 @@ pub fn parse_cpu_spec(spec: &str, topo: &CpuTopology) -> CpuSet {
         // 语义名展开为对应核心层，其余按数字范围解析
         let seg = match part {
             "e-core" => &topo.e_core,
+            "m-core" => &topo.m_core,
             "p-core" => &topo.p_core,
             "hp-core" => &topo.hp_core,
             "all-core" => &topo.present_cpus,
@@ -217,7 +218,7 @@ pub fn parse_cpu_spec(spec: &str, topo: &CpuTopology) -> CpuSet {
     set
 }
 
-/// 创建 cpuset 子目录并写入 cpus 与 mems
+/// 创建 cpuset 子目录并写入 cpus 与 mems；目录已存在且内容一致时跳过重写
 pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
     let c_path = CString::new(path).expect("cpuset path 受控输入，无 NUL");
     let ret = unsafe { libc::mkdir(c_path.as_ptr(), 0o755) };
@@ -225,6 +226,12 @@ pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
         let err = io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EEXIST) {
             return false;
+        }
+        // 已存在且内容一致：跳过重写，避免重复触发内核 cpuset 事件
+        if cpuset_file_eq(&format!("{}/cpus", path), cpus)
+            && cpuset_file_eq(&format!("{}/mems", path), mems)
+        {
+            return true;
         }
     }
     if unsafe { libc::chmod(c_path.as_ptr(), 0o755) } != 0 {
@@ -241,19 +248,51 @@ pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
     fs::write(&mems_path, mems).is_ok()
 }
 
-/// 按合并后的 CPU 集合确保 cpuset 子目录存在，返回目录名（cpuset 未启用或创建失败返回空串）
-pub fn ensure_cpuset_dir(cpus: &CpuSet, topo: &CpuTopology) -> String {
-    if !topo.cpuset_enabled {
-        return String::new();
+/// 按位图等价比较控制文件当前内容与期望内容（内核会规范化输出，如 0,1,2 → 0-2）
+fn cpuset_file_eq(path: &str, want: &str) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .map(|cur| parse_cpu_ranges(&cur, None) == parse_cpu_ranges(want, None))
+        .unwrap_or(false)
+}
+
+/// 删除 cpuset 子目录：先把目录内任务迁回根 cpuset，再逐层移除目录树。
+/// 仅接受 /dev/cpuset 的直接子目录名；目录不存在或 cpuset 不可用时视为清理成功。
+pub(crate) fn remove_cpuset_dir(name: &str) -> bool {
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        return false;
     }
-    let dir_name = cpus.to_range_string();
-    let path = format!("{}/{}", base_cpuset(), dir_name);
-    // create_cpuset_dir 已处理 EEXIST，重复调用幂等
-    if create_cpuset_dir(&path, &dir_name, &topo.mems_str) {
-        dir_name
-    } else {
-        String::new()
+    let root = "/dev/cpuset";
+    let root_c = CString::new(root).expect("常量字符串无 NUL");
+    if unsafe { libc::access(root_c.as_ptr(), libc::F_OK) } != 0 {
+        return true;
     }
+    let path = format!("{}/{}", root, name);
+    if fs::metadata(&path).is_err() {
+        return true;
+    }
+    remove_tree(&path);
+    fs::metadata(&path).is_err()
+}
+
+/// 递归移除 cpuset 目录树：先删子目录，再把自己的 tasks 迁回根 cpuset 后 rmdir。
+/// 任务必须迁出才能 rmdir，否则内核返回 EBUSY；根 cpuset 覆盖全部 CPU 与内存节点，迁移总是合法。
+fn remove_tree(dir: &str) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir())
+                && let Some(p) = entry.path().to_str()
+            {
+                remove_tree(p);
+            }
+        }
+    }
+    if let Ok(tasks) = fs::read_to_string(format!("{}/tasks", dir)) {
+        for tid in tasks.split_whitespace() {
+            let _ = fs::write("/dev/cpuset/tasks", format!("{}\n", tid));
+        }
+    }
+    let _ = fs::remove_dir(dir);
 }
 
 #[derive(Clone)]
@@ -263,12 +302,14 @@ pub struct CpuTopology {
     pub mems_str: String,
     pub cpuset_enabled: bool,
     pub e_core: CpuSet,
+    pub m_core: CpuSet,
     pub p_core: CpuSet,
     pub hp_core: CpuSet,
 }
 
-/// 按 cpufreq 策略检测核心分层，按最高频率升序分组：首组为 e-core，末组为 hp-core，中间为 p-core
-fn detect_core_types() -> (CpuSet, CpuSet, CpuSet) {
+/// 按 cpufreq 策略检测核心分层，按最高频率升序分组。
+/// 档位映射：1 档全归 e；2 档 e/h，p 与 m 空；3 档 e/p/h，m 空；4 档及以上 e/m/p/h，其余中间档并入 p。
+fn detect_core_types() -> (CpuSet, CpuSet, CpuSet, CpuSet) {
     let mut groups: Vec<(u64, Vec<usize>)> = Vec::new();
     // 读取每个 policy 的 related_cpus 与 cpuinfo_max_freq，按频率合并同组
     if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/cpufreq") {
@@ -303,15 +344,23 @@ fn detect_core_types() -> (CpuSet, CpuSet, CpuSet) {
         }
     }
     groups.sort_by_key(|(f, _)| *f);
+    assign_groups(&groups)
+}
+
+/// 按频率组数把各组分配给 e/m/p/h 四档（入参按频率升序）
+fn assign_groups(groups: &[(u64, Vec<usize>)]) -> (CpuSet, CpuSet, CpuSet, CpuSet) {
     let mut e = CpuSet::new();
+    let mut m = CpuSet::new();
     let mut p = CpuSet::new();
     let mut h = CpuSet::new();
     let n = groups.len();
     for (i, (_, cpus)) in groups.iter().enumerate() {
-        let target = if i == 0 {
+        let target: &mut CpuSet = if n == 1 || i == 0 {
             &mut e
         } else if i == n - 1 {
             &mut h
+        } else if n >= 4 && i == 1 {
+            &mut m
         } else {
             &mut p
         };
@@ -319,7 +368,7 @@ fn detect_core_types() -> (CpuSet, CpuSet, CpuSet) {
             target.set(cpu);
         }
     }
-    (e, p, h)
+    (e, m, p, h)
 }
 
 /// 初始化 CPU 拓扑，检测 cpuset 可用性并创建 BASE_CPUSET 目录
@@ -330,6 +379,7 @@ pub fn init_cpu_topo() -> CpuTopology {
         mems_str: String::new(),
         cpuset_enabled: false,
         e_core: CpuSet::new(),
+        m_core: CpuSet::new(),
         p_core: CpuSet::new(),
         hp_core: CpuSet::new(),
     };
@@ -338,8 +388,9 @@ pub fn init_cpu_topo() -> CpuTopology {
         topo.present_str = content.trim().to_string();
     }
     topo.present_cpus = parse_cpu_ranges(&topo.present_str, None);
-    let (e, p, h) = detect_core_types();
+    let (e, m, p, h) = detect_core_types();
     topo.e_core = e;
+    topo.m_core = m;
     topo.p_core = p;
     topo.hp_core = h;
 
@@ -362,4 +413,192 @@ pub fn init_cpu_topo() -> CpuTopology {
     }
 
     topo
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set_of(cpus: &[usize]) -> CpuSet {
+        let mut s = CpuSet::new();
+        for &c in cpus {
+            s.set(c);
+        }
+        s
+    }
+
+    fn topo_with_cores(e: &[usize], m: &[usize], p: &[usize], h: &[usize], present: &[usize]) -> CpuTopology {
+        CpuTopology {
+            present_cpus: set_of(present),
+            present_str: String::new(),
+            mems_str: "0".to_string(),
+            cpuset_enabled: false,
+            e_core: set_of(e),
+            m_core: set_of(m),
+            p_core: set_of(p),
+            hp_core: set_of(h),
+        }
+    }
+
+    #[test]
+    fn range_string_empty() {
+        assert_eq!(CpuSet::new().to_range_string(), "");
+    }
+
+    #[test]
+    fn range_string_single() {
+        assert_eq!(set_of(&[3]).to_range_string(), "3");
+    }
+
+    #[test]
+    fn range_string_contiguous() {
+        assert_eq!(set_of(&[0, 1, 2, 3]).to_range_string(), "0-3");
+    }
+
+    #[test]
+    fn range_string_segments() {
+        assert_eq!(set_of(&[0, 1, 4, 5, 6, 9]).to_range_string(), "0-1,4-6,9");
+    }
+
+    #[test]
+    fn range_string_spans_words() {
+        assert_eq!(set_of(&[62, 63, 64, 65]).to_range_string(), "62-65");
+    }
+
+    #[test]
+    fn parse_ranges_basic() {
+        let got = parse_cpu_ranges("0-3,5", None);
+        assert_eq!(got, set_of(&[0, 1, 2, 3, 5]));
+    }
+
+    #[test]
+    fn parse_ranges_reversed() {
+        let got = parse_cpu_ranges("5-2", None);
+        assert_eq!(got, set_of(&[2, 3, 4, 5]));
+    }
+
+    #[test]
+    fn parse_ranges_clamped_to_setsize() {
+        let got = parse_cpu_ranges(&format!("0-{}", CPU_SETSIZE + 100), None);
+        assert_eq!(got.count(), CPU_SETSIZE);
+        assert!(got.is_set(CPU_SETSIZE - 1));
+        assert!(!got.is_set(CPU_SETSIZE));
+    }
+
+    #[test]
+    fn parse_ranges_invalid_parts_skipped() {
+        assert_eq!(parse_cpu_ranges("x,2,", None), set_of(&[2]));
+        assert_eq!(parse_cpu_ranges("", None), CpuSet::new());
+    }
+
+    #[test]
+    fn parse_ranges_present_filter() {
+        let present = set_of(&[0, 1, 2, 3, 8]);
+        let got = parse_cpu_ranges("0-8", Some(&present));
+        assert_eq!(got, set_of(&[0, 1, 2, 3, 8]));
+    }
+
+    #[test]
+    fn parse_spec_semantic_cores() {
+        let topo = topo_with_cores(&[0, 1], &[], &[2, 3], &[4, 5, 6], &[0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(parse_cpu_spec("e-core", &topo), set_of(&[0, 1]));
+        assert_eq!(parse_cpu_spec("p-core", &topo), set_of(&[2, 3]));
+        assert_eq!(parse_cpu_spec("hp-core", &topo), set_of(&[4, 5, 6]));
+        assert_eq!(parse_cpu_spec("all-core", &topo), set_of(&[0, 1, 2, 3, 4, 5, 6]));
+    }
+
+    #[test]
+    fn parse_spec_mcore() {
+        let topo = topo_with_cores(&[0, 1], &[2, 3], &[4, 5], &[6], &[0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(parse_cpu_spec("m-core", &topo), set_of(&[2, 3]));
+        assert_eq!(parse_cpu_spec("e-core,m-core", &topo), set_of(&[0, 1, 2, 3]));
+    }
+
+    #[test]
+    fn parse_spec_mixed() {
+        let topo = topo_with_cores(&[0, 1], &[], &[2, 3], &[4], &[0, 1, 2, 3, 4]);
+        let got = parse_cpu_spec("e-core,3-4", &topo);
+        assert_eq!(got, set_of(&[0, 1, 3, 4]));
+    }
+
+    #[test]
+    fn parse_spec_empty() {
+        let topo = topo_with_cores(&[0], &[], &[1], &[2], &[0, 1, 2]);
+        assert_eq!(parse_cpu_spec("", &topo), CpuSet::new());
+    }
+
+    #[test]
+    fn assign_groups_tiers() {
+        let g = |freq: u64, cpus: &[usize]| (freq, cpus.to_vec());
+        // 1 档：全部归 e
+        let (e, m, p, h) = assign_groups(&[g(1000, &[0, 1, 2, 3])]);
+        assert_eq!(e, set_of(&[0, 1, 2, 3]));
+        assert_eq!(m, set_of(&[]));
+        assert_eq!(p, set_of(&[]));
+        assert_eq!(h, set_of(&[]));
+        // 2 档：低频 e，高频 hp，p 与 m 为空
+        let (e, m, p, h) = assign_groups(&[g(1000, &[0, 1]), g(2500, &[2, 3])]);
+        assert_eq!(e, set_of(&[0, 1]));
+        assert_eq!(m, set_of(&[]));
+        assert_eq!(p, set_of(&[]));
+        assert_eq!(h, set_of(&[2, 3]));
+        // 3 档：e/p/h，m 空
+        let (e, m, p, h) = assign_groups(&[g(1000, &[0, 1]), g(1800, &[2, 3]), g(2500, &[4])]);
+        assert_eq!(e, set_of(&[0, 1]));
+        assert_eq!(m, set_of(&[]));
+        assert_eq!(p, set_of(&[2, 3]));
+        assert_eq!(h, set_of(&[4]));
+        // 4 档：e/m/p/h 一一对应
+        let (e, m, p, h) = assign_groups(&[
+            g(1000, &[0, 1]),
+            g(1800, &[2, 3]),
+            g(2500, &[4, 5]),
+            g(3200, &[6]),
+        ]);
+        assert_eq!(e, set_of(&[0, 1]));
+        assert_eq!(m, set_of(&[2, 3]));
+        assert_eq!(p, set_of(&[4, 5]));
+        assert_eq!(h, set_of(&[6]));
+        // 5 档：第 2 档进 m，其余中间档进 p
+        let (e, m, p, h) = assign_groups(&[
+            g(1000, &[0]),
+            g(1500, &[1]),
+            g(2000, &[2]),
+            g(2500, &[3]),
+            g(3000, &[4]),
+        ]);
+        assert_eq!(e, set_of(&[0]));
+        assert_eq!(m, set_of(&[1]));
+        assert_eq!(p, set_of(&[2, 3]));
+        assert_eq!(h, set_of(&[4]));
+    }
+
+    #[test]
+    fn count_and_or() {
+        let mut a = set_of(&[0, 1]);
+        a.or(&set_of(&[1, 2]));
+        assert_eq!(a, set_of(&[0, 1, 2]));
+        assert_eq!(a.count(), 3);
+    }
+
+    #[test]
+    fn cpuset_file_eq_normalizes_ranges() {
+        let dir = std::env::temp_dir().join(format!("appopt-cpuset-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("cpus");
+        std::fs::write(&f, "0-2\n").unwrap();
+        assert!(cpuset_file_eq(f.to_str().unwrap(), "0-2"));
+        assert!(cpuset_file_eq(f.to_str().unwrap(), "0,1,2"));
+        assert!(!cpuset_file_eq(f.to_str().unwrap(), "0-3"));
+        assert!(!cpuset_file_eq(f.to_str().unwrap(), "0,2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_cpuset_dir_rejects_invalid_names() {
+        assert!(!remove_cpuset_dir(""));
+        assert!(!remove_cpuset_dir("a/b"));
+        assert!(!remove_cpuset_dir("/dev/cpuset"));
+        assert!(!remove_cpuset_dir(".."));
+    }
 }

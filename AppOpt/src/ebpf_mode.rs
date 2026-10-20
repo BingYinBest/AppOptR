@@ -46,7 +46,7 @@ fn comm_str(comm: &[u8; 16]) -> &str {
 }
 
 pub struct EbpfState {
-    pub event_rx: mpsc::Receiver<EbpfProcEvent>,
+    pub event_rx: mpsc::Receiver<Vec<EbpfProcEvent>>,
     pub reader_thread: Option<thread::JoinHandle<()>>,
     pub bpf: Ebpf,
     pub cache: ProcCache,
@@ -351,7 +351,7 @@ pub fn ebpf_init() -> Option<EbpfState> {
         }
     };
 
-    let (tx, rx) = mpsc::channel::<EbpfProcEvent>();
+    let (tx, rx) = mpsc::channel::<Vec<EbpfProcEvent>>();
     let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if wakeup_fd < 0 {
         eprintln!("eBPF: eventfd 创建失败，回退到 /proc 轮询");
@@ -376,7 +376,7 @@ pub fn ebpf_init() -> Option<EbpfState> {
 /// RingBuf 读取线程，epoll 阻塞等待事件 wakeup_fd 用于 Drop 唤醒退出
 fn ebpf_reader(
     mut ring_buf: aya::maps::RingBuf<aya::maps::MapData>,
-    tx: mpsc::Sender<EbpfProcEvent>,
+    tx: mpsc::Sender<Vec<EbpfProcEvent>>,
     wakeup_fd: RawFd,
 ) {
     let name = CString::new("EbpfReader").unwrap();
@@ -424,16 +424,19 @@ fn ebpf_reader(
             break;
         }
 
+        // 单批收集后一次发送，减少 channel 锁竞争
+        let mut batch: Vec<EbpfProcEvent> = Vec::new();
         while let Some(item) = ring_buf.next() {
             let bytes: &[u8] = &item;
             if bytes.len() >= std::mem::size_of::<EbpfProcEvent>() {
                 let event: EbpfProcEvent =
                     unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const EbpfProcEvent) };
-                if tx.send(event).is_err() {
-                    unsafe { libc::close(epfd) };
-                    return;
-                }
+                batch.push(event);
             }
+        }
+        if !batch.is_empty() && tx.send(batch).is_err() {
+            unsafe { libc::close(epfd) };
+            return;
         }
     }
     unsafe { libc::close(epfd) };
@@ -501,9 +504,11 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
             // 内核态已插入 APPLIED_MAP 占位，RENAME 时触发完整处理
         }
 
-        EBPF_EVENT_RENAME => {
-            event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg);
-        }
+        EBPF_EVENT_RENAME
+            if !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) => {
+                state.cache.task_del(tid);
+                applied_del(&mut state.bpf, tid);
+            }
 
         _ => {}
     }
@@ -543,7 +548,7 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     proc_walk(cfg, |_| true, |pid, pkg, has_thread_rules| {
         let Some(tids) = task_tids(pid) else { return };
         for tid in tids {
-            let t_name = if has_thread_rules {
+            let t_name = if has_thread_rules || cfg.has_dyn_rules.contains(pkg) {
                 tid_comm(tid).unwrap_or_default()
             } else {
                 String::new()

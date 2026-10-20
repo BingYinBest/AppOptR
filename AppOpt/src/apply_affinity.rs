@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::FileExt;
@@ -70,21 +71,40 @@ pub fn affinity_set(
             return false;
         }
     if topo.cpuset_enabled {
-        let tasks_path = if cpuset_dir.is_empty() {
-            format!("{}/tasks", base_cpuset())
+        let base = base_cpuset();
+        let mut path = [0u8; 256];
+        let mut cur = std::io::Cursor::new(&mut path[..]);
+        if cpuset_dir.is_empty() {
+            let _ = write!(cur, "{}/tasks", base);
         } else {
-            format!("{}/{}/tasks", base_cpuset(), cpuset_dir)
-        };
-        let _ = fs::OpenOptions::new()
+            let _ = write!(cur, "{}/{}/tasks", base, cpuset_dir);
+        }
+        let len = cur.position() as usize;
+        let path_str = std::str::from_utf8(&path[..len]).unwrap_or_default();
+        if let Err(e) = fs::OpenOptions::new()
             .append(true)
-            .open(&tasks_path)
-            .and_then(|mut f| writeln!(f, "{}", tid));
+            .open(path_str)
+            .and_then(|mut f| writeln!(f, "{}", tid))
+        {
+            eprintln!("警告: cpuset 迁移 tid={} 到 {} 失败 ({})", tid, path_str, e);
+        }
     }
     if let Err(e) = cpus.set_affinity(tid) {
         return e.raw_os_error() == Some(libc::ESRCH);
     }
 
     false
+}
+
+/// 读取 /proc 全部数字 pid 快照
+pub(crate) fn proc_snapshot() -> Option<HashSet<i32>> {
+    let entries = fs::read_dir("/proc").ok()?;
+    Some(
+        entries
+            .flatten()
+            .filter_map(|ent| ent.file_name().to_string_lossy().parse::<i32>().ok())
+            .collect(),
+    )
 }
 
 /// 遍历 /proc 匹配目标进程，返回 匹配数与总进程数
