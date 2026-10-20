@@ -11,12 +11,12 @@ AppOptR（线程优化）：Android 应用线程 CPU 亲和性管理工具，以
 
 ## 构建与验证
 
-- 容器/CI 的 PATH 不含 `~/.cargo/bin`，手动跑工具链命令先 `bash -c 'source scripts/env.sh && ...'`；`./build.sh` 顶层**不** source env.sh，直跑会在第 1 步 `cargo test` 报 not found，完整发布须 `bash -c 'source scripts/env.sh && ./build.sh'`。
+- 工具链：`cargo`/`rustc` 系统版在 PATH（`/usr/bin`，rust 1.93），host 单测/release 可直接跑；交叉编译与 eBPF 需要 rustup stable/nightly + NDK linker，由 `scripts/env.sh` 提供——`build-android.sh`/`build-ebpf.sh`/`package.sh` 内部均 `source env.sh`，故 `./build.sh` 可直接执行。手动跑非 host 目标或 rustup 子命令时，先 `bash -c 'source scripts/env.sh && ...'`。
 - host 单测：`cd AppOpt && cargo test`（覆盖配置解析/规则匹配/文本编辑/cpuset/缓存，不依赖 Android target 与真机）。
-- lint：`cd AppOpt && cargo clippy --all-targets -- -D warnings`（当前零警告；容器未装 clippy 组件，需 `rustup component add clippy` 补装）。
+- lint：`cd AppOpt && cargo clippy --all-targets -- -D warnings`（当前零警告，容器内 clippy 已装可直接跑）。
 - `./build.sh` = host 回归 → aarch64/x86_64 交叉编译 → eBPF 字节码 → 打包 zip 到 `modules_update/`，产物自动覆盖 `module/bin/`。主程序必须 64 位（32 位 target 触发 `compile_error!`，依赖 `cpu_set_t` 布局）。
 - `AppOpt-ebpf` 按 aya 标准用 nightly 以 `bpfel-unknown-none` + `-Z build-std=core` 编译，不是可执行文件；release `opt-level=2`（旧 `s` 不再被新版 bpf-linker 的 LLVM 接受，勿改回）。
-- 交叉编译环境已装好（rustup stable+nightly、NDK r30、bpf-linker v0.11.1），`scripts/env.sh` 统一配置并 `check_env` 校验，缺工具时按它的提示补齐。NDK 默认路径 `/root/android/ndk/android-ndk-r30`，可用 `NDK` 环境变量覆盖（CI 用的是 GitHub runner 自带 NDK）。
+- 交叉编译环境已装好（rustup stable+nightly、NDK r30、bpf-linker v0.11.1），`scripts/env.sh` 统一配置并 `check_env` 校验，缺工具时按它的提示补齐。NDK 默认路径 `/root/android/ndk/android-ndk-r30`，可用 `NDK` 环境变量覆盖。
 - Cargo.toml 版本规则：`AppOpt/Cargo.toml` 必须与模块版本一致（面板「版本」显示的是 CARGO_PKG_VERSION）；`AppOpt-ebpf/Cargo.toml` 与之独立，按改动复杂度更新（大改升主/次版本，小改小幅升）。
 
 ## 发布规则
@@ -30,6 +30,13 @@ AppOptR（线程优化）：Android 应用线程 CPU 亲和性管理工具，以
 - CLI：`-c` 配置路径、`-s` 检查间隔（秒）、`-b` cpuset 目录名、`-w` 启用 Web（仅监听 127.0.0.1:8889）；`AppOpt.json` 存面板设置，CLI 参数优先。
 - 更换 cpuset 目录名（CLI `-b` 与设置中名字不同，或 web 面板改名）会自动清除旧目录：先把旧目录 tasks 里的任务迁回 `/dev/cpuset` 根再 rmdir（含子目录，任务不迁出即删会 EBUSY），实现在 `cpuset.rs::remove_cpuset_dir`；无需手动清理。
 - 模式三态：`0` 自动（eBPF 初始化失败即回退）、`1` 强制 eBPF（失败每 30s 重试）、`2` 强制 /proc。eBPF 依赖内核 BTF（`/sys/kernel/btf/vmlinux`）且同目录存在 `AppOpt-ebpf` 字节码，缺任一即回退——是正常行为不是 bug。
+- `module/service.sh`（开机自启）除拉起 `AppOpt -w` 外，还会把每个 cpu 的 `core_ctl/min_cpus` 拉到 `max_cpus`（放开小核限制）；末尾有注释掉的绿厂 oiface / 米系 joyose 处理开关，需要时手动解注释。
+
+## Web 面板（`AppOpt/web/index.html`）
+
+- 容器内可直接试跑验证前端，无需真机：`cd AppOpt && ./target/debug/AppOpt -w -c <applist.conf>`；`/dev/cpuset` 不可写（容器/无 root）时仍正常启动，面板功能可用，只是亲和性不生效。端口固定 `8889`（`web.rs::WEB_PORT`），不可配置。
+- 面板 HTML 经 `include_str!` 内嵌进二进制，改完必须 `cargo build`，只改文件不重编译等于没改。确认改动进包：`unzip -p modules_update/线程优化vX.Y.Z.zip bin/arm64-v8a/AppOpt | grep -a '<内嵌片段>'`。
+- 状态页数字是滚动动画（`.num` 为滚动窗口、`.dig` 为 0-9 数字列，靠 `translateY(calc(-1em*var(--d)))` 定位）：窗口需 `align-items:flex-start` 让列顶对齐，用 `center` 会让整列居中、抵消 `--d` 偏移，导致数字错位或空白；改这块用多位数（如 `6314`）和个位数各验一次。
 
 ## 规则语法（与常见 cpuset 工具不同）
 

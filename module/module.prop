@@ -1,6 +1,6 @@
 id=AppOpt
 name=线程优化
-version=2.3.2
-versionCode=196
+version=2.3.3
+versionCode=197
 author=Suto&未央
 description=一款Android应用线程CPU亲和性管理工具，基于规则配置文件，将指定应用的进程与线程绑定到指定的CPU核心簇，支持eBPF事件驱动与/proc轮询双模式，配置热加载及时生效，另支持按负载动态调度的elect/load规则
