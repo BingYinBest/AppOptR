@@ -14,11 +14,8 @@ pub struct TaskEntry {
     pub cpuset_dir: String,
     pub is_thread_rule: bool,
 }
-
-/// 双模式共用进程缓存，eBPF 事件驱动增量维护，proc 模式触发全量重建
 pub struct ProcCache {
     pub tasks: HashMap<i32, TaskEntry>,
-    /// 动态规则（按负载选举/阈值）运行时状态
     pub dyn_state: DynState,
 }
 
@@ -39,23 +36,15 @@ impl ProcCache {
     pub fn task_del(&mut self, tid: i32) {
         self.tasks.remove(&tid);
     }
-
-    /// 批量删除属于任一消失 pid 的全部 tid 条目（进程退出/pid 复用），避免逐 pid 遍历
     pub fn remove_pkgs(&mut self, pids: &HashSet<i32>) {
         self.tasks.retain(|_, e| !pids.contains(&e.pid));
     }
-
-    /// 仅保留属于 pid 且仍存活于 task 目录的 tid（线程退出清理）
     pub fn retain_pkg_tids(&mut self, pid: i32, live: &HashSet<i32>) {
         self.tasks.retain(|tid, e| e.pid != pid || live.contains(tid));
     }
-
-    /// comm 匹配包名，线程名时回退主线程条目
     pub fn pkg_lookup_comm(&self, pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
         comm_to_pkg(pid, comm, cfg).or_else(|| self.tasks.get(&pid).map(|e| e.pkg.clone()))
     }
-
-    /// 计算并应用线程亲和性，保护已有线程规则绑定防止降级
     pub fn task_apply<F>(
         &mut self,
         tid: i32,
@@ -85,8 +74,6 @@ impl ProcCache {
         if !result.is_thread_rule && self.tasks.get(&tid).is_some_and(|old| old.is_thread_rule) {
             return true;
         }
-
-        // 结果与缓存一致时跳过重复分配，事件路径（EXEC/RENAME 等）对已绑定线程的重复应用归零
         if self.tasks.get(&tid).is_some_and(|old| {
             old.pkg == pkg
                 && old.cpus == result.cpus
@@ -115,8 +102,6 @@ impl ProcCache {
         );
         true
     }
-
-    /// 遍历 tasks 应用亲和性，返回 dead_tids 供 eBPF 调用方清理 APPLIED_MAP
     pub fn affinity_sync(&mut self, topo: &CpuTopology) -> Vec<i32> {
         let dead_tids: Vec<i32> = self
             .tasks
@@ -211,7 +196,6 @@ mod tests {
     }
 
     fn dyn_cfg() -> AppConfig {
-        // 含包级静态规则，验证非动态组线程走静态 fallback
         let mut c = cfg(vec![rule("com.a", "", &[0, 3])]);
         let spec = DynSpec::Elect {
             winner: Box::new(cpus_of(&[6, 7])),
@@ -240,8 +224,6 @@ mod tests {
         assert!(cache.task_apply(100, 100, "com.a", "Thread-9", &c, &mut apply));
         let (cpus, _) = captured.unwrap();
         assert_eq!(cpus.to_range_string(), "0-1", "首次命中动态组应落在低档");
-
-        // 重复事件不应重新分配
         let mut calls = 0;
         let mut apply2 = |_t: i32, _: &CpuSet, _: &str| {
             calls += 1;
@@ -310,5 +292,4 @@ mod tests {
         assert_eq!(calls, 2, "线程名变化导致结果不同应重新分配");
     }
 }
-
 

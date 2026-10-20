@@ -6,8 +6,6 @@ use std::os::unix::fs::FileExt;
 use crate::{MAX_PKG_LEN, MAX_THREAD_LEN};
 use crate::config::AppConfig;
 use crate::cpuset::{base_cpuset, CpuSet, CpuTopology};
-
-/// 栈上构建 /proc/{pid}/{suffix} 路径读取文件
 fn read_proc_file<'a>(pid: i32, suffix: &str, buf: &'a mut [u8]) -> Option<&'a [u8]> {
     let mut path = [0u8; 32];
     let mut cur = std::io::Cursor::new(&mut path[..]);
@@ -57,15 +55,12 @@ pub(crate) fn task_tids(pid: i32) -> Option<Vec<i32>> {
             .collect(),
     )
 }
-
-/// 对单线程应用亲和性，返回 true 表示 ESRCH 线程已退出
 pub fn affinity_set(
     tid: i32,
     cpus: &CpuSet,
     cpuset_dir: &str,
     topo: &CpuTopology,
 ) -> bool {
-    // sched_getaffinity 短路，已符合目标零开销返回
     if let Some(curr) = CpuSet::get_affinity(tid)
         && curr == *cpus {
             return false;
@@ -95,8 +90,6 @@ pub fn affinity_set(
 
     false
 }
-
-/// 读取 /proc 全部数字 pid 快照
 pub(crate) fn proc_snapshot() -> Option<HashSet<i32>> {
     let entries = fs::read_dir("/proc").ok()?;
     Some(
@@ -106,8 +99,6 @@ pub(crate) fn proc_snapshot() -> Option<HashSet<i32>> {
             .collect(),
     )
 }
-
-/// 遍历 /proc 匹配目标进程，返回 匹配数与总进程数
 pub(crate) fn proc_walk(
     cfg: &AppConfig,
     filter: impl Fn(i32) -> bool,

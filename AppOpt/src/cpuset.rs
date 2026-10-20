@@ -8,13 +8,9 @@ use std::sync::RwLock;
 pub const CPU_SETSIZE: usize = 1024;
 pub const CPU_WORD_BITS: usize = 64;
 pub const CPU_WORDS: usize = CPU_SETSIZE / CPU_WORD_BITS;
-
-/// BASE_CPUSET 运行时路径，web 端可热更新，未设置时默认 /dev/cpuset/AppOpt
 static BASE_CPUSET_PATH: RwLock<Option<String>> = RwLock::new(None);
 
 pub const DEFAULT_CPUSET_NAME: &str = "AppOpt";
-
-/// 设置 BASE_CPUSET 目录名，name 为空或含 / 时忽略
 pub fn set_base_cpuset(name: &str) {
     if name.is_empty() || name.contains('/') {
         return;
@@ -27,7 +23,7 @@ pub fn base_cpuset() -> String {
         .read()
         .unwrap()
         .clone()
-        .unwrap_or_else(|| "/dev/cpuset/AppOpt".to_string())
+        .unwrap_or_else(|| format!("/dev/cpuset/{DEFAULT_CPUSET_NAME}"))
 }
 
 const _: () = assert!(std::mem::size_of::<CpuSet>() == std::mem::size_of::<libc::cpu_set_t>());
@@ -189,8 +185,6 @@ pub fn parse_cpu_ranges(spec: &str, present: Option<&CpuSet>) -> CpuSet {
     }
     set
 }
-
-/// 解析 CPU 规格，支持语义核心名(e-core/p-core/hp-core)与数字范围混合
 pub fn parse_cpu_spec(spec: &str, topo: &CpuTopology) -> CpuSet {
     let mut set = CpuSet::new();
     if spec.is_empty() {
@@ -201,7 +195,6 @@ pub fn parse_cpu_spec(spec: &str, topo: &CpuTopology) -> CpuSet {
         if part.is_empty() {
             continue;
         }
-        // 语义名展开为对应核心层，其余按数字范围解析
         let seg = match part {
             "e-core" => &topo.e_core,
             "m-core" => &topo.m_core,
@@ -217,8 +210,6 @@ pub fn parse_cpu_spec(spec: &str, topo: &CpuTopology) -> CpuSet {
     }
     set
 }
-
-/// 创建 cpuset 子目录并写入 cpus 与 mems；目录已存在且内容一致时跳过重写
 pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
     let c_path = CString::new(path).expect("cpuset path 受控输入，无 NUL");
     let ret = unsafe { libc::mkdir(c_path.as_ptr(), 0o755) };
@@ -227,7 +218,6 @@ pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
         if err.raw_os_error() != Some(libc::EEXIST) {
             return false;
         }
-        // 已存在且内容一致：跳过重写，避免重复触发内核 cpuset 事件
         if cpuset_file_eq(&format!("{}/cpus", path), cpus)
             && cpuset_file_eq(&format!("{}/mems", path), mems)
         {
@@ -247,17 +237,12 @@ pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
     let mems_path = format!("{}/mems", path);
     fs::write(&mems_path, mems).is_ok()
 }
-
-/// 按位图等价比较控制文件当前内容与期望内容（内核会规范化输出，如 0,1,2 → 0-2）
 fn cpuset_file_eq(path: &str, want: &str) -> bool {
     fs::read_to_string(path)
         .ok()
         .map(|cur| parse_cpu_ranges(&cur, None) == parse_cpu_ranges(want, None))
         .unwrap_or(false)
 }
-
-/// 删除 cpuset 子目录：先把目录内任务迁回根 cpuset，再逐层移除目录树。
-/// 仅接受 /dev/cpuset 的直接子目录名；目录不存在或 cpuset 不可用时视为清理成功。
 pub(crate) fn remove_cpuset_dir(name: &str) -> bool {
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
         return false;
@@ -274,9 +259,6 @@ pub(crate) fn remove_cpuset_dir(name: &str) -> bool {
     remove_tree(&path);
     fs::metadata(&path).is_err()
 }
-
-/// 递归移除 cpuset 目录树：先删子目录，再把自己的 tasks 迁回根 cpuset 后 rmdir。
-/// 任务必须迁出才能 rmdir，否则内核返回 EBUSY；根 cpuset 覆盖全部 CPU 与内存节点，迁移总是合法。
 fn remove_tree(dir: &str) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -306,12 +288,8 @@ pub struct CpuTopology {
     pub p_core: CpuSet,
     pub hp_core: CpuSet,
 }
-
-/// 按 cpufreq 策略检测核心分层，按最高频率升序分组。
-/// 档位映射：1 档全归 e；2 档 e/h，p 与 m 空；3 档 e/p/h，m 空；4 档及以上 e/m/p/h，其余中间档并入 p。
 fn detect_core_types() -> (CpuSet, CpuSet, CpuSet, CpuSet) {
     let mut groups: Vec<(u64, Vec<usize>)> = Vec::new();
-    // 读取每个 policy 的 related_cpus 与 cpuinfo_max_freq，按频率合并同组
     if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/cpufreq") {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -346,8 +324,6 @@ fn detect_core_types() -> (CpuSet, CpuSet, CpuSet, CpuSet) {
     groups.sort_by_key(|(f, _)| *f);
     assign_groups(&groups)
 }
-
-/// 按频率组数把各组分配给 e/m/p/h 四档（入参按频率升序）
 fn assign_groups(groups: &[(u64, Vec<usize>)]) -> (CpuSet, CpuSet, CpuSet, CpuSet) {
     let mut e = CpuSet::new();
     let mut m = CpuSet::new();
@@ -370,8 +346,6 @@ fn assign_groups(groups: &[(u64, Vec<usize>)]) -> (CpuSet, CpuSet, CpuSet, CpuSe
     }
     (e, m, p, h)
 }
-
-/// 初始化 CPU 拓扑，检测 cpuset 可用性并创建 BASE_CPUSET 目录
 pub fn init_cpu_topo() -> CpuTopology {
     let mut topo = CpuTopology {
         present_cpus: CpuSet::new(),
@@ -530,25 +504,21 @@ mod tests {
     #[test]
     fn assign_groups_tiers() {
         let g = |freq: u64, cpus: &[usize]| (freq, cpus.to_vec());
-        // 1 档：全部归 e
         let (e, m, p, h) = assign_groups(&[g(1000, &[0, 1, 2, 3])]);
         assert_eq!(e, set_of(&[0, 1, 2, 3]));
         assert_eq!(m, set_of(&[]));
         assert_eq!(p, set_of(&[]));
         assert_eq!(h, set_of(&[]));
-        // 2 档：低频 e，高频 hp，p 与 m 为空
         let (e, m, p, h) = assign_groups(&[g(1000, &[0, 1]), g(2500, &[2, 3])]);
         assert_eq!(e, set_of(&[0, 1]));
         assert_eq!(m, set_of(&[]));
         assert_eq!(p, set_of(&[]));
         assert_eq!(h, set_of(&[2, 3]));
-        // 3 档：e/p/h，m 空
         let (e, m, p, h) = assign_groups(&[g(1000, &[0, 1]), g(1800, &[2, 3]), g(2500, &[4])]);
         assert_eq!(e, set_of(&[0, 1]));
         assert_eq!(m, set_of(&[]));
         assert_eq!(p, set_of(&[2, 3]));
         assert_eq!(h, set_of(&[4]));
-        // 4 档：e/m/p/h 一一对应
         let (e, m, p, h) = assign_groups(&[
             g(1000, &[0, 1]),
             g(1800, &[2, 3]),
@@ -559,7 +529,6 @@ mod tests {
         assert_eq!(m, set_of(&[2, 3]));
         assert_eq!(p, set_of(&[4, 5]));
         assert_eq!(h, set_of(&[6]));
-        // 5 档：第 2 档进 m，其余中间档进 p
         let (e, m, p, h) = assign_groups(&[
             g(1000, &[0]),
             g(1500, &[1]),

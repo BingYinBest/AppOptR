@@ -250,7 +250,6 @@ fn spec_swap(raw: &str, cpus: &str) -> String {
     let rhs = &raw[eq + 1..cut];
     let val = rhs.trim_start();
     let lead = rhs.len() - val.len();
-    // 动态规则（elect(...)/load(...)）整体替换到闭合括号，避免内部空格截断
     let v_end = if val.starts_with("elect(") || val.starts_with("load(") {
         val.find(')').map(|p| p + 1).unwrap_or(val.len())
     } else {

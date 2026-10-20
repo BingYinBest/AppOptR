@@ -13,8 +13,6 @@ use crate::cpuset::{parse_cpu_spec, CpuSet, CpuTopology};
 pub static INOTIFY_SUPPORTED: AtomicBool = AtomicBool::new(false);
 pub static INOTIFY_FD: AtomicI32 = AtomicI32::new(-1);
 pub static INOTIFY_WD: AtomicI32 = AtomicI32::new(-1);
-
-/// 运行时可调参数，web 端热更新
 pub static CHECK_INTERVAL: AtomicU64 = AtomicU64::new(2);
 pub static FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
 pub static CONFIG_FILE: Mutex<String> = Mutex::new(String::new());
@@ -25,16 +23,12 @@ pub struct AffinityRule {
     pub thread_pattern: CString,
     pub cpus: CpuSet,
 }
-
-/// 动态规则规格：按负载选举最重线程，或按阈值升降档
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DynSpec {
-    /// 组内负载最高线程绑 winner，其余绑 others
     Elect {
         winner: Box<CpuSet>,
         others: Box<CpuSet>,
     },
-    /// 单线程负载 > threshold% 绑 high，否则绑 low
     Load {
         high: Box<CpuSet>,
         low: Box<CpuSet>,
@@ -61,8 +55,6 @@ pub struct DynRule {
     pub thread_pattern: CString,
     pub spec: DynSpec,
 }
-
-/// 解析产出的规则条目，动态规则与静态规则分开构建
 #[derive(Debug, PartialEq)]
 pub enum ParsedRule {
     Static { pkg: String, thread: String, cpus: String },
@@ -74,24 +66,17 @@ pub struct AppConfig {
     pub pkgs: HashSet<String>,
     pub has_thread_rules: HashSet<String>,
     pub topo: CpuTopology,
-    /// pkg → 该包规则下标，绑定路径避免全量规则扫描
     pub rules_by_pkg: HashMap<String, Vec<usize>>,
-    /// pkg → 线程名 → 无 fnmatch 元字符的规则下标，精确线程名 O(1) 命中
     pub exact_thread_rules: HashMap<String, HashMap<String, Vec<usize>>>,
-    /// 动态规则（按负载选举/阈值），优先于同包静态线程规则
     pub dyn_rules: Vec<DynRule>,
-    /// pkg → 动态规则下标
     pub dyn_by_pkg: HashMap<String, Vec<usize>>,
     pub has_dyn_rules: HashSet<String>,
-    /// 已确认存在的 cpuset 子目录名，避免重复创建的系统调用
     pub cpuset_dirs: Mutex<HashSet<String>>,
 }
 
 pub static CURRENT_CONFIG: Mutex<Option<Arc<AppConfig>>> = Mutex::new(None);
 
 pub static PARSE_FAILS: AtomicUsize = AtomicUsize::new(0);
-
-/// 校验 CPU 规格形态
 pub fn spec_like(s: &str) -> bool {
     let mut any = false;
     for part in s.split(',') {
@@ -114,8 +99,6 @@ pub fn spec_like(s: &str) -> bool {
     }
     any
 }
-
-/// fnmatch 模式是否含通配元字符（FNM_NOESCAPE 下 \\ 为字面量，无需转义处理）
 pub fn pattern_has_meta(s: &str) -> bool {
     s.contains('*') || s.contains('?') || s.contains('[')
 }
@@ -204,36 +187,15 @@ pub fn parse_outer(p: &str) -> OuterLine<'_> {
     }
 }
 
-fn add_rule(
-    rules: &mut Vec<AffinityRule>,
-    topo: &CpuTopology,
-    pkg: &str,
-    thread: &str,
-    cpus_spec: &str,
-) -> bool {
-    if pkg.is_empty() || pkg.len() >= MAX_PKG_LEN || thread.len() >= MAX_THREAD_LEN {
-        return false;
-    }
-    if pkg.bytes().chain(thread.bytes()).any(|b| b < 0x20 || b == 0x7f) {
-        return false;
-    }
-    if !spec_like(cpus_spec) {
-        return false;
-    }
+fn add_rule(rules: &mut Vec<AffinityRule>, topo: &CpuTopology, pkg: &str, thread: &str, cpus_spec: &str) {
     let set = parse_cpu_spec(cpus_spec, topo);
-    if set.count() == 0 {
-        return false;
-    }
     rules.push(AffinityRule {
         pkg: pkg.to_string(),
         thread: thread.to_string(),
         thread_pattern: CString::new(thread).unwrap_or_default(),
         cpus: set,
     });
-    true
 }
-
-/// 解析动态规则规格（elect(a|b) / load(a|b|n)），非动态形态返回 None
 pub fn dyn_spec_try(cpus: &str, topo: &CpuTopology) -> Option<DynSpec> {
     let s = cpus.trim();
     if let Some(inner) = s.strip_prefix("elect(").and_then(|r| r.strip_suffix(')')) {
@@ -275,8 +237,6 @@ pub fn dyn_spec_try(cpus: &str, topo: &CpuTopology) -> Option<DynSpec> {
     }
     None
 }
-
-/// 校验并解析单条规则，动态形态走 Dyn 分支，静态形态走 Static 分支（纯函数，不触碰文件系统）
 fn parse_rule_entry(
     pkg: &str,
     thread: &str,
@@ -306,8 +266,6 @@ fn parse_rule_entry(
         cpus: cpus.to_string(),
     })
 }
-
-/// 解析配置文本为有效规则条目（静态 + 动态）与失败计数
 fn parse_rules(content: &str, topo: &CpuTopology) -> (Vec<ParsedRule>, usize) {
     let mut rules: Vec<ParsedRule> = Vec::new();
     let mut fail_cnt: usize = 0;
@@ -414,8 +372,6 @@ fn parse_rules(content: &str, topo: &CpuTopology) -> (Vec<ParsedRule>, usize) {
 
     (rules, fail_cnt)
 }
-
-/// 加载配置文件，返回 None 表示未变化或解析失败
 pub fn load_config(
     config_file: &str,
     topo: &CpuTopology,
@@ -768,12 +724,10 @@ mod tests {
 
     #[test]
     fn split_single_line_forms() {
-        // 真实可解析形态：} 位于 = 之前
         assert_eq!(
             split_single_line("com.example{Render}=6-7}"),
             Some(("com.example", "Render", "6-7}"))
         );
-        // 常规内联写法 } 在 = 之后，不进入该分支
         assert_eq!(split_single_line("com.example{RenderThread=6-7}"), None);
         assert_eq!(split_single_line("com.example=0-3"), None);
         assert_eq!(split_single_line("com.example{RenderThread=6-7"), None);
@@ -813,7 +767,6 @@ mod tests {
             parse_outer("com.example{Render}=6-7}"),
             OuterLine::Single { pkg: "com.example", thread: "Render", cpus: "6-7}", open: false }
         ));
-        // 常规内联写法 } 在 = 之后时退化为 Rule 分支
         assert!(matches!(
             parse_outer("com.example{RenderThread=6-7}"),
             OuterLine::Rule { pkg: "com.example{RenderThread", cpus: "6-7}", open: false }

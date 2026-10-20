@@ -10,13 +10,16 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::apply_affinity::{read_cmdline, task_tids};
+use crate::apply_affinity::{proc_snapshot, read_cmdline, task_tids, tid_comm};
 use crate::cache::ProcCache;
 use crate::config::{
     config_reload_now, dyn_spec_try, spec_like,
     CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, FORCE_RELOAD, PARSE_FAILS,
 };
-use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology, DEFAULT_CPUSET_NAME};
+use crate::cpuset::{
+    base_cpuset, create_cpuset_dir, parse_cpu_spec, remove_cpuset_dir, set_base_cpuset, CpuSet,
+    CpuTopology, DEFAULT_CPUSET_NAME,
+};
 use crate::ebpf_mode::ebpf_probe;
 use crate::rule_edit::{rule_delete, rule_delete_pkg, rule_rename, rule_upsert, RuleEdit};
 use crate::{lock_ignore_poison, EBPF_GAVE_UP, MAX_PKG_LEN, MAX_THREAD_LEN};
@@ -28,12 +31,8 @@ pub static MODE_FORCE: AtomicU8 = AtomicU8::new(0);
 pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub static WEB_STATS: Mutex<Option<WebStats>> = Mutex::new(None);
-
-/// 并发连接上限，防本地恶意应用慢连接耗尽线程（每连接有 5s 读超时，慢连接可持续占用）
 const MAX_CONNS: usize = 64;
 static CONN_ACTIVE: AtomicUsize = AtomicUsize::new(0);
-
-/// 输入建议的 /proc 扫描结果缓存，TTL 内避免重复全盘枚举
 const SUGGEST_TTL: Duration = Duration::from_secs(3);
 static SUGGEST_PKG_CACHE: Mutex<Option<(Instant, BTreeMap<String, usize>)>> = Mutex::new(None);
 type ThreadSuggestCache = BTreeMap<String, (Instant, BTreeMap<String, usize>)>;
@@ -48,14 +47,10 @@ pub struct WebStats {
     pub ebpf: bool,
     pub uptime: u64,
 }
-
-/// 缓存统计
 pub fn cache_stats(cache: &ProcCache) -> (usize, usize) {
     let pkgs: HashSet<&str> = cache.tasks.values().map(|e| e.pkg.as_str()).collect();
     (cache.tasks.len(), pkgs.len())
 }
-
-/// 启动 web 前端
 pub fn web_start() {
     let listener = match TcpListener::bind(("127.0.0.1", WEB_PORT)) {
         Ok(l) => l,
@@ -147,7 +142,7 @@ fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
             "content-type" => ctype = v.to_ascii_lowercase(),
             "content-length" => len = v.parse().unwrap_or(usize::MAX),
             "connection" => conn = v.to_ascii_lowercase(),
-            "transfer-encoding" => return None, // 拒绝 chunked
+            "transfer-encoding" => return None,
             _ => {}
         }
     }
@@ -245,8 +240,6 @@ fn sys_procs() -> u16 {
         0
     }
 }
-
-/// CPU 集合转语义名
 fn spec_name(cpus: &CpuSet, topo: &CpuTopology) -> String {
     if cpus.count() > 0 {
         if *cpus == topo.e_core {
@@ -267,8 +260,6 @@ fn spec_name(cpus: &CpuSet, topo: &CpuTopology) -> String {
     }
     cpus.to_range_string()
 }
-
-/// 动态规则序列化为可回写的配置文件文本（elect/load 语法）
 fn dyn_spec_str(spec: &crate::config::DynSpec, topo: &CpuTopology) -> String {
     match spec {
         crate::config::DynSpec::Elect { winner, others } => format!(
@@ -339,7 +330,6 @@ fn rules_json() -> String {
             .unwrap()
             .push(json!({ "thread": r.thread, "spec": spec_name(&r.cpus, &cfg.topo) }));
     }
-    // 动态规则（按负载选举/阈值）与静态规则同组展示，spec 为可回写文本
     for r in &cfg.dyn_rules {
         let gi = *index.entry(r.pkg.clone()).or_insert_with(|| {
             groups.push(json!({ "pkg": r.pkg, "items": [] }));
@@ -356,8 +346,6 @@ fn rules_json() -> String {
     }
     json!({ "rules": groups }).to_string()
 }
-
-/// 名称校验
 fn token_ok(s: &str, max: usize) -> bool {
     let t = s.trim();
     !t.is_empty()
@@ -466,8 +454,6 @@ fn rule_rename_api(req: &Request) -> (u16, String) {
         RuleEdit::IoErr => err_json(500, "配置文件写入失败"),
     }
 }
-
-/// 输入建议
 fn suggest_api(req: &Request) -> (u16, String) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
         return err_json(400, "请求体不是合法 JSON");
@@ -487,8 +473,6 @@ fn suggest_api(req: &Request) -> (u16, String) {
     };
     (200, json!({ "ok": true, "list": list }).to_string())
 }
-
-/// 枚举包名
 fn installed_pkgs() -> Vec<String> {
     fs::read_dir("/data/data")
         .map(|dirs| {
@@ -501,16 +485,12 @@ fn installed_pkgs() -> Vec<String> {
 }
 
 fn for_each_pid(mut f: impl FnMut(i32)) {
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            if let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() {
-                f(pid);
-            }
+    if let Some(pids) = proc_snapshot() {
+        for pid in pids {
+            f(pid);
         }
     }
 }
-
-/// 排序键
 fn rank_top(counts: BTreeMap<String, usize>, lq: &str) -> Vec<(String, usize)> {
     let mut ranked: Vec<(u8, Reverse<usize>, String)> = counts
         .into_iter()
@@ -547,12 +527,6 @@ fn suggest_pkgs(q: &str) -> Vec<(String, usize)> {
     rank_top(counts, &q.to_ascii_lowercase())
 }
 
-fn thread_comm(pid: i32, tid: i32) -> Option<String> {
-    let s = fs::read_to_string(format!("/proc/{}/task/{}/comm", pid, tid)).ok()?;
-    let name = s.trim_end_matches(['\0', '\n']).trim();
-    (!name.is_empty()).then(|| name.to_string())
-}
-
 fn suggest_threads(pkg: &str, q: &str) -> Vec<(String, usize)> {
     let counts: BTreeMap<String, usize> = {
         let mut guard = lock_ignore_poison(&SUGGEST_THREAD_CACHE);
@@ -565,7 +539,7 @@ fn suggest_threads(pkg: &str, q: &str) -> Vec<(String, usize)> {
             for_each_pid(|pid| {
                 if read_cmdline(pid).as_deref() == Some(pkg) {
                     for tid in task_tids(pid).unwrap_or_default() {
-                        if let Some(comm) = thread_comm(pid, tid) {
+                        if let Some(comm) = tid_comm(tid) {
                             *m.entry(comm).or_insert(0) += 1;
                         }
                     }
@@ -620,7 +594,6 @@ fn config_set_api(req: &Request) -> (u16, String) {
 
     if let Some(m) = mode {
         MODE_FORCE.store(m as u8, Ordering::Relaxed);
-        // 用户主动切回 eBPF 方向时清除放弃标记允许重试
         if m != 2 {
             EBPF_GAVE_UP.store(false, Ordering::Relaxed);
         }
@@ -630,9 +603,9 @@ fn config_set_api(req: &Request) -> (u16, String) {
     }
     if let Some(n) = name {
         let old = base_cpuset();
-        crate::cpuset::set_base_cpuset(n);
+        set_base_cpuset(n);
         if old != base_cpuset() {
-            crate::cpuset::remove_cpuset_dir(old.rsplit('/').next().unwrap_or_default());
+            remove_cpuset_dir(old.rsplit('/').next().unwrap_or_default());
         }
         if let Some(cfg) = current_cfg()
             && cfg.topo.cpuset_enabled {

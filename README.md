@@ -5,7 +5,7 @@ Android 应用 CPU 亲和性管理工具
 
  **使用说明请参考** 
 
-http://appopt.suto.top
+#官方网址:http://appopt.suto.top
 
 ### 模块说明
 
@@ -52,17 +52,19 @@ com.example=e-core,p-core
 
 ```
 com.example:push=0-3
+com.example:push=e-core
 ```
 
-包名带 `:子进程名` 限定子进程，如 `com.tencent.mm:push`。
+包名带 `:子进程名` 限定子进程，如 `com.tencent.mm:push`；右侧同样支持语义核心。
 
 **线程规则**
 
 ```
 com.example{RenderThread}=0-3
+com.example{RenderThread}=hp-core
 ```
 
-将应用内指定线程绑定到 CPU，线程名支持 fnmatch 通配（`*`、`?`、`[...]`）。
+将应用内指定线程绑定到 CPU，线程名支持 fnmatch 通配（`*`、`?`、`[...]`）；右侧支持语义核心，如渲染线程绑高性能大核。
 
 **块语法**
 
@@ -71,9 +73,13 @@ com.example=0-3 {
     RenderThread=6-7
     Thread-1=0-5
 }
+com.example=e-core,p-core {
+    RenderThread=hp-core
+    Thread-1=e-core
+}
 ```
 
-块内为线程规则，块首可带包级规则（`com.example=... {` 形式）。
+块内为线程规则，块首可带包级规则（`com.example=... {` 形式），块首与块内均支持语义核心。
 
 **语义核心**
 
@@ -82,8 +88,8 @@ com.example=0-3 {
 | 名称 | 含义 |
 |------|------|
 | `e-core` | 能效小核 |
-| `m-core` | 中频档（4 档及以上芯片的第二档） |
-| `p-core` | 性能中核 |
+| `m-core` | 低频中核 |
+| `p-core` | 高频中核 |
 | `hp-core` | 高性能大核 |
 | `all-core` | 所有核心 |
 
@@ -92,8 +98,10 @@ com.example=0-3 {
 **动态规则（v2.3.0+）**
 
 ```
-Thread-*=elect(6-7 | 0-5)    组内负载最高线程绑 6-7，其余绑 0-5
-Thread-*=load(7 | 4-6 | 50)  单线程负载>50% 绑 7，否则绑 4-6
+Thread-*=elect(6-7 | 0-5)            组内负载最高线程绑 6-7，其余绑 0-5
+Thread-*=elect(hp-core | e-core)     组内负载最高线程绑高性能大核，其余绑能效小核
+Thread-*=load(7 | 4-6 | 50)          单线程负载>50% 绑 7，否则绑 4-6
+Thread-*=load(hp-core | p-core | 50) 单线程负载>50% 绑高性能大核，否则绑性能中核
 ```
 
 - `elect`：组内负载最高线程绑高档，其余绑低档；换人需超现任 20% 且驻留 5s

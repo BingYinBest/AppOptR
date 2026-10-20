@@ -15,8 +15,6 @@ const EVENT_EXEC: u32 = 2;
 const EVENT_RENAME: u32 = 3;
 const EVENT_EXIT: u32 = 4;
 
-/// 4 类 tracepoint 字段布局：fork 读 child_pid/child_comm，exec/exit 用 bpf_get_current_pid_tgid，rename 读 newcomm
-/// 用户态解析 format 文件注入的字段偏移，因内核版本设备而异禁止硬编码
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct TracepointOffsets {
@@ -25,7 +23,6 @@ struct TracepointOffsets {
     rename_newcomm: u32,
 }
 
-/// 进程事件，布局需与用户态 EbpfProcEvent 一致
 #[repr(C)]
 struct ProcEvent {
     pid: i32,
@@ -37,22 +34,18 @@ struct ProcEvent {
 const MAP_CAPACITY: u32 = 16 << 5;
 const APPLIED_CAPACITY: u32 = 8192;
 
-/// 白名单键为包名前 15 字节或末 15 字节，与 comm 截断上限一致
 #[map]
 static TARGET_COMM_MAP: HashMap<[u8; 15], u32> = HashMap::with_max_entries(MAP_CAPACITY, 0);
 
-/// 已应用亲和性表 tid 到 CPU mask，LruHashMap 配合 ESRCH 兜底
 #[map]
 static APPLIED_MAP: LruHashMap<u32, u64> = LruHashMap::with_max_entries(APPLIED_CAPACITY, 0);
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
-/// 用户态注入的 tracepoint 字段偏移单条 Array 索引 0
 #[map]
 static OFFSETS_MAP: Array<TracepointOffsets> = Array::with_max_entries(1, 0);
 
-/// 读取偏移，fork_child_pid 为 0 视为未注入返回 None
 #[inline(always)]
 fn offsets_load() -> Option<TracepointOffsets> {
     OFFSETS_MAP.get(0).and_then(|o| {
@@ -64,7 +57,6 @@ fn offsets_load() -> Option<TracepointOffsets> {
     })
 }
 
-/// 事件元信息
 struct EventMeta {
     pid: i32,
     tid: i32,
@@ -78,7 +70,6 @@ fn applied_lookup(key: u32) -> bool {
     unsafe { APPLIED_MAP.get(key) }.is_some()
 }
 
-/// 在 comm 16 字节上以 15 字节窗口滑动匹配白名单
 #[inline(always)]
 fn whitelist_matched(comm: &[u8; 16]) -> bool {
     for pos in 0..=1usize {
@@ -98,7 +89,6 @@ fn submit_event(event: ProcEvent) {
     }
 }
 
-/// 解析 fork 字段，统一用 parent_tgid 作为 pid 确保 clone 共享 TGID，tid 为 child_pid
 #[inline(always)]
 fn fork_parse(ctx: &TracePointContext, offsets: &TracepointOffsets) -> EventMeta {
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -128,8 +118,6 @@ fn exec_parse() -> EventMeta {
     }
 }
 
-/// FORK 检查已管理线程的父线程，EXEC 检查自身，均以白名单兜底
-/// FORK 通过时立即占位 APPLIED_MAP[child_tid]=0，防 RENAME 竞态过滤
 #[inline(always)]
 fn report_named_event(ctx: &TracePointContext, event_type: u32) -> u32 {
     let meta = if event_type == EVENT_FORK {
@@ -174,7 +162,6 @@ fn sched_process_exec(ctx: TracePointContext) -> u32 {
     report_named_event(&ctx, EVENT_EXEC)
 }
 
-/// 捕获线程改名，已管理线程直接放行否则白名单匹配
 #[tracepoint(name = "task_rename", category = "task")]
 fn task_rename(ctx: TracePointContext) -> u32 {
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -205,7 +192,6 @@ fn task_rename(ctx: TracePointContext) -> u32 {
     0
 }
 
-/// 捕获线程退出，已管理线程清理 APPLIED_MAP
 #[tracepoint(name = "sched_process_exit", category = "sched")]
 fn sched_process_exit(_ctx: TracePointContext) -> u32 {
     let pid_tgid = bpf_get_current_pid_tgid();

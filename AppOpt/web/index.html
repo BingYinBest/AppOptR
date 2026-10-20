@@ -245,7 +245,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 <div class="card">
 <div class="card-title">简介</div>
-<p class="text">AppOpt 是一款 Android 应用 CPU 亲和性管理工具。基于规则配置文件，将指定应用的进程与线程绑定到合适的 CPU 核心（小核省电、大核高性能），配置保存后即时热加载，无需重启应用。</p>
+<p class="text">AppOptR 是一款 Android 应用线程 CPU 亲和性管理工具，基于规则配置文件，将指定应用的进程与线程绑定到指定的 CPU 核心簇，支持 eBPF 事件驱动与 /proc 轮询双模式，配置热加载及时生效，另支持按负载动态调度的 elect/load 规则。</p>
 </div>
 <div class="card">
 <div class="card-title">使用说明</div>
@@ -253,13 +253,15 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <li>规则页点击「添加」，输入应用包名，可同时配置包级默认（可选）与多条线程规则后一次保存</li>
 <li>设置页可切换 eBPF / Proc 工作模式、cpuset 目录名、检查间隔与配置文件路径</li>
 <li>配置文件也可直接手工编辑，保存后自动热加载</li>
-<li>更多规则编写说明参考官网文档</li>
+<li>更多规则编写说明参考官网文档和本仓库 README.md</li>
 </ol></div>
 </div>
 <div class="card">
 <div class="card-title">作者</div>
-<div class="row"><span class="label">作者</span><span class="value">Suto</span></div>
-<div class="row"><span class="label">主页</span><span class="value mono">http://appopt.suto.top</span></div>
+<div class="row"><span class="label">原作者</span><span class="value">Suto</span></div>
+<div class="row"><span class="label">二改作者</span><span class="value">未央</span></div>
+<div class="row"><span class="label">官网文档</span><span class="value mono"><a href="http://appopt.suto.top" target="_blank">http://appopt.suto.top</a></span></div>
+<div class="row"><span class="label">Github仓库</span><span class="value mono"><a href="https://github.com/BingYinBest/AppOpt-Rust" target="_blank">https://github.com/BingYinBest/AppOpt-Rust</a></span></div>
 </div>
 </div>
 </section>
@@ -656,7 +658,6 @@ $('mr-save').onclick=async()=>{
   try{
     if(mrMode==='edit-app'){
       if(pkg!==mrOldPkg)await api('/api/rule/rename',{old:mrOldPkg,new:pkg});
-      // 清理被删的线程行与被清空的包级规则（thread=='' 即包级）
       const cur=new Set(jobs.map(j=>j.thread));
       for(const th of mrOldThreads)if(!cur.has(th))await api('/api/rule/del',{pkg,thread:th});
       if(mrHadPkgRule&&!cur.has(''))await api('/api/rule/del',{pkg,thread:''});

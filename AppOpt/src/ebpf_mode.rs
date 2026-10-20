@@ -12,8 +12,6 @@ use crate::apply_affinity::{affinity_set, proc_walk, task_tids, tid_comm};
 use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
 use crate::cpuset::CpuSet;
-
-/// eBPF 进程事件，布局需与内核态 ProcEvent 一致
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct EbpfProcEvent {
@@ -27,8 +25,6 @@ pub const EBPF_EVENT_FORK: u32 = 1;
 pub const EBPF_EVENT_EXEC: u32 = 2;
 pub const EBPF_EVENT_RENAME: u32 = 3;
 pub const EBPF_EVENT_EXIT: u32 = 4;
-
-/// 用户态注入内核的 tracepoint 字段偏移，布局需与内核态 TracepointOffsets 一致
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct EbpfOffsets {
@@ -38,8 +34,6 @@ struct EbpfOffsets {
 }
 
 unsafe impl Pod for EbpfOffsets {}
-
-/// 将内核 comm 截断于首个 NUL 并 trim 尾部空白
 fn comm_str(comm: &[u8; 16]) -> &str {
     let end = comm.iter().position(|&b| b == 0).unwrap_or(16);
     std::str::from_utf8(&comm[..end]).unwrap_or("").trim()
@@ -56,7 +50,6 @@ pub struct EbpfState {
 
 impl Drop for EbpfState {
     fn drop(&mut self) {
-        // 写 eventfd 唤醒 reader 线程的 epoll_wait 后 join 等待退出
         if self.wakeup_fd >= 0 {
             let val: u64 = 1;
             unsafe {
@@ -103,8 +96,6 @@ fn attach_tracepoint(bpf: &mut Ebpf, category: &str, name: &str, required: bool)
     }
     true
 }
-
-/// 构建白名单键，每个包名生成前 15 字节与末 15 字节键
 fn comm_keys_build<'a, I: IntoIterator<Item = &'a String>>(pkgs: I) -> Vec<[u8; 15]> {
     let mut entries: Vec<[u8; 15]> = Vec::new();
     for pkg in pkgs {
@@ -126,8 +117,6 @@ fn comm_keys_build<'a, I: IntoIterator<Item = &'a String>>(pkgs: I) -> Vec<[u8; 
     entries.dedup();
     entries
 }
-
-/// 初始化 TARGET_COMM_MAP，返回 true 表示需重载
 pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32) -> bool {
     let entries = comm_keys_build(pkgs.iter());
 
@@ -180,8 +169,6 @@ pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32)
     );
     false
 }
-
-/// 检测 tracefs 根路径，现代内核优先 tracing 旧内核回退 debug/tracing
 fn tracefs_root() -> Option<&'static str> {
     if fs::metadata("/sys/kernel/tracing").is_ok() {
         return Some("/sys/kernel/tracing");
@@ -191,8 +178,6 @@ fn tracefs_root() -> Option<&'static str> {
     }
     None
 }
-
-/// 解析 tracepoint format 文件提取字段名到偏移映射，字段名剥离数组下标
 fn tracepoint_parse(root: &str, category: &str, name: &str) -> Option<HashMap<String, u32>> {
     let path = format!("{}/events/{}/{}/format", root, category, name);
     let content = fs::read_to_string(&path).ok()?;
@@ -219,8 +204,6 @@ fn tracepoint_parse(root: &str, category: &str, name: &str) -> Option<HashMap<St
     }
     Some(offsets)
 }
-
-/// 解析本机 format 文件并注入 OFFSETS_MAP 索引 0，失败返回 false 由调用方回退 /proc
 fn offsets_inject(bpf: &mut Ebpf) -> bool {
     let Some(root) = tracefs_root() else {
         eprintln!("eBPF: tracefs 不可用，回退到 /proc 轮询");
@@ -263,8 +246,6 @@ fn offsets_inject(bpf: &mut Ebpf) -> bool {
     );
     true
 }
-
-/// 初始化 eBPF，加载程序 attach tracepoint 创建 RingBuf 线程，失败回退 /proc
 pub fn ebpf_init() -> Option<EbpfState> {
     if !ebpf_probe() {
         eprintln!("eBPF: 内核不支持（缺少 BTF），回退到 /proc 轮询");
@@ -318,8 +299,6 @@ pub fn ebpf_init() -> Option<EbpfState> {
             return None;
         }
     };
-
-    // attach 前注入偏移避免首批事件读到空 map
     if !offsets_inject(&mut bpf) {
         return None;
     }
@@ -372,8 +351,6 @@ pub fn ebpf_init() -> Option<EbpfState> {
         comm_capacity: capacity,
     })
 }
-
-/// RingBuf 读取线程，epoll 阻塞等待事件 wakeup_fd 用于 Drop 唤醒退出
 fn ebpf_reader(
     mut ring_buf: aya::maps::RingBuf<aya::maps::MapData>,
     tx: mpsc::Sender<Vec<EbpfProcEvent>>,
@@ -418,13 +395,9 @@ fn ebpf_reader(
             }
             break;
         }
-
-        // wakeup 事件优先退出
         if events.iter().take(n as usize).any(|e| e.u64 == 1) {
             break;
         }
-
-        // 单批收集后一次发送，减少 channel 锁竞争
         let mut batch: Vec<EbpfProcEvent> = Vec::new();
         while let Some(item) = ring_buf.next() {
             let bytes: &[u8] = &item;
@@ -465,8 +438,6 @@ fn applied_clear(bpf: &mut Ebpf) {
         let _ = m.remove(k);
     }
 }
-
-/// 应用亲和性并写 APPLIED_MAP，返回 true 表示 tid 已退出
 fn affinity_apply(
     tid: i32,
     cpus: &CpuSet,
@@ -480,8 +451,6 @@ fn affinity_apply(
     }
     dead
 }
-
-/// 事件派发，按 event_type 增量处理 FORK/RENAME/EXEC/EXIT
 pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfState) {
     let tid = event.tid;
     let pid = event.pid;
@@ -500,8 +469,6 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
             }
 
         EBPF_EVENT_FORK => {
-            // 子线程继承父线程亲和性与 cpuset
-            // 内核态已插入 APPLIED_MAP 占位，RENAME 时触发完整处理
         }
 
         EBPF_EVENT_RENAME
@@ -513,8 +480,6 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
         _ => {}
     }
 }
-
-/// 统一事件处理 pkg_lookup_comm 到 task_apply
 fn event_apply(
     cache: &mut ProcCache,
     bpf: &mut Ebpf,
@@ -531,16 +496,12 @@ fn event_apply(
         affinity_apply(t, c, d, cfg, bpf)
     })
 }
-
-/// 定期纠正 affinity_sync 清死亡 tid
 pub fn affinity_check(state: &mut EbpfState, cfg: &AppConfig) {
     let dead_tids = state.cache.affinity_sync(&cfg.topo);
     for tid in dead_tids {
         applied_del(&mut state.bpf, tid);
     }
 }
-
-/// 启动或配置更新时全量扫描 /proc
 pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     state.cache.clear();
     applied_clear(&mut state.bpf);

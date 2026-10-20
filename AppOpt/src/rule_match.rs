@@ -4,15 +4,11 @@ use crate::{lock_ignore_poison, MAX_THREAD_LEN};
 use crate::apply_affinity::read_cmdline;
 use crate::config::{pattern_has_meta, AppConfig};
 use crate::cpuset::{base_cpuset, create_cpuset_dir, CpuSet};
-
-/// 线程亲和性计算结果
 pub struct AffinityResult {
     pub cpus: CpuSet,
     pub cpuset_dir: String,
     pub is_thread_rule: bool,
 }
-
-/// 线程规则合并后的 cpuset 目录，缓存已存在目录避免重复创建系统调用
 pub(crate) fn cpuset_dir_cached(cpus: &CpuSet, cfg: &AppConfig) -> String {
     if !cfg.topo.cpuset_enabled {
         return String::new();
@@ -32,8 +28,6 @@ pub(crate) fn cpuset_dir_cached(cpus: &CpuSet, cfg: &AppConfig) -> String {
         String::new()
     }
 }
-
-/// 线程规则 CPU 累加，无线程匹配走包级 fallback，仍无则返回 None
 pub fn thread_affinity(
     pkg: &str,
     thread: &str,
@@ -46,7 +40,6 @@ pub fn thread_affinity(
     let pkg_rules: &[usize] = cfg.rules_by_pkg.get(pkg).map(Vec::as_slice).unwrap_or(&[]);
 
     if !thread.is_empty() {
-        // 精确线程名 O(1)，未命中再对该包含通配符的规则做 fnmatch
         if let Some(exact) = cfg.exact_thread_rules.get(pkg).and_then(|m| m.get(thread)) {
             for &i in exact {
                 cpus.or(&cfg.rules[i].cpus);
@@ -63,7 +56,6 @@ pub fn thread_affinity(
                 matched = true;
             }
         }
-        // 按合并后的 CPU 集合重算 cpuset 目录，确保与亲和性一致
         if matched {
             cpuset_dir = cpuset_dir_cached(&cpus, cfg);
         }
@@ -99,8 +91,6 @@ pub fn thread_affinity(
         })
     }
 }
-
-/// POSIX fnmatch 封装，需预转换为 CString
 pub(crate) fn fnmatch_c(pattern: &CString, string: &str) -> bool {
     if string.len() >= MAX_THREAD_LEN {
         return false;
@@ -109,13 +99,10 @@ pub(crate) fn fnmatch_c(pattern: &CString, string: &str) -> bool {
     buf[..string.len()].copy_from_slice(string.as_bytes());
     unsafe { libc::fnmatch(pattern.as_ptr(), buf.as_ptr() as *const _, libc::FNM_NOESCAPE) == 0 }
 }
-
-/// 通过内核 comm 匹配配置包名
 pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
     if cfg.pkgs.contains(comm) {
         return Some(comm.to_string());
     }
-    // comm 大于等于15字节则读取 cmdline
     if comm.len() >= 15
         && cfg
             .pkgs
@@ -267,8 +254,6 @@ mod tests {
         let c = cfg(vec![thread_rule("com.a", "RenderThread", &[6])]);
         assert!(thread_affinity("com.other", "x", &c).is_none());
     }
-
-    /// 复刻优化前的全量线性扫描实现，作为等价性参照
     fn linear_thread_affinity(pkg: &str, thread: &str, cfg: &AppConfig) -> Option<(CpuSet, bool, String)> {
         let mut cpus = CpuSet::new();
         let mut matched = false;
