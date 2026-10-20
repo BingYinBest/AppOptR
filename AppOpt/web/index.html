@@ -69,6 +69,8 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .grp-inner{overflow:hidden}
 .rule-row{display:flex;align-items:center;gap:8px;padding:10px 14px;border-top:1px solid var(--border)}
 .rule-name{flex:1;min-width:0;word-break:break-all;font-size:13px}
+.rule-row.dyn-row .rule-spec .rule-actions{margin-left:auto;display:flex;gap:2px}
+.chip.dyn.dyn-multi{display:inline-flex;flex-direction:column;align-items:center;gap:1px;line-height:1.3;text-align:center}
 .rule-sub{color:var(--sub);font-size:12px}
 .rule-add{display:flex;align-items:center;justify-content:center;gap:4px;margin:10px 14px;padding:9px 0;border:1px dashed var(--border);border-radius:10px;color:var(--sub);font-size:13px;width:calc(100% - 28px)}
 .rule-add:active{opacity:.5}
@@ -177,8 +179,8 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card" id="s-card-cores">
 <div class="card-title">核心分层</div>
 <div class="row"><span class="label">e-core 小核</span><span class="chip e" id="s-ecore">-</span></div>
-<div class="row" id="s-row-mcore"><span class="label">m-core 中频</span><span class="chip m" id="s-mcore">-</span></div>
-<div class="row" id="s-row-pcore"><span class="label">p-core 中核</span><span class="chip p" id="s-pcore">-</span></div>
+<div class="row" id="s-row-mcore"><span class="label">m-core 低频中核</span><span class="chip m" id="s-mcore">-</span></div>
+<div class="row" id="s-row-pcore"><span class="label">p-core 高频中核</span><span class="chip p" id="s-pcore">-</span></div>
 <div class="row"><span class="label">hp-core 大核</span><span class="chip h" id="s-hcore">-</span></div>
 <div class="row"><span class="label">全部核心</span><span class="chip c" id="s-all">-</span></div>
 </div>
@@ -374,7 +376,8 @@ async function refreshStat(){
 
 let rulesData=[];
 function chipCls(s){return /^(elect|load)\(/.test(s)?'dyn':s==='e-core'?'e':s==='m-core'?'m':s==='p-core'?'p':s==='hp-core'?'h':'c'}
-function chipHtml(s){return `<span class="chip ${chipCls(s)}">${esc(s)}</span>`}
+function chipHtml(s){const m=s.match(/^(elect|load)\((.+)\)$/);if(m){const t=m[2].split('|').map(x=>x.trim()).slice(0,2);return `<span class="chip dyn dyn-multi"><span>${esc(m[1])}</span><span>${esc(t.join(' '))}</span></span>`}return `<span class="chip ${chipCls(s)}">${esc(s)}</span>`}
+function tierOfSpec(s){if(!s)return 4;const all=[...s.matchAll(/(hp-core|p-core|m-core|e-core)/g)].map(m=>m[1]);if(!all.length)return 4;return all.some(x=>x==='hp-core')?0:all.some(x=>x==='p-core')?1:all.some(x=>x==='m-core')?2:3}
 const ICO_EDIT='<svg viewBox="0 0 24 24"><path d="M17 3l4 4L8 20l-5 1 1-5z"/></svg>';
 const ICO_TRASH='<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-8 0l1 13h8l1-13"/></svg>';
 async function loadRules(){
@@ -386,6 +389,15 @@ async function loadRules(){
   }catch(e){toast(e.message)}
 }
 function grpInner(g,gi){
+  const items=g.items.map((it,ii)=>[ii,it]).sort((a,b)=>{
+    const ai=a[1],bi=b[1];
+    if(!ai.thread)return -1;
+    if(!bi.thread)return 1;
+    if(!!ai.dyn!==!!bi.dyn)return ai.dyn?1:-1;
+    const ta=tierOfSpec(ai.spec),tb=tierOfSpec(bi.spec);
+    if(ta!==tb)return ta-tb;
+    return ai.thread.localeCompare(bi.thread);
+  });
   return `
 <div class="grp-head">
 <svg class="chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
@@ -395,12 +407,17 @@ function grpInner(g,gi){
 <button class="icon-btn danger" data-delpkg="${gi}" title="删除该应用全部规则">${ICO_TRASH}</button>
 </div>
 <div class="grp-body"><div class="grp-inner">
-${g.items.map((it,ii)=>`
-<div class="rule-row">
+${items.map(([ii,it])=>it.dyn
+  ?`<div class="rule-row">
+<span class="rule-name">${esc(it.thread)}</span>
+${chipHtml(it.spec)}
+<button class="icon-btn" data-edit="${gi}:${ii}" title="编辑动态规则">${ICO_EDIT}</button>
+<button class="icon-btn danger" data-del="${gi}:${ii}" title="删除">${ICO_TRASH}</button>
+</div>`
+  :`<div class="rule-row">
 <span class="rule-name">${it.thread?esc(it.thread):'<span class="rule-sub">包级默认</span>'}</span>
 ${chipHtml(it.spec)}
-${it.dyn?'<span class="chip dyn">动态</span>':''}
-<button class="icon-btn" data-edit="${gi}:${ii}" title="${it.dyn?'编辑动态规则':(it.thread?'编辑线程规则':'编辑包级规则')}">${ICO_EDIT}</button>
+<button class="icon-btn" data-edit="${gi}:${ii}" title="${it.thread?'编辑线程规则':'编辑包级规则'}">${ICO_EDIT}</button>
 <button class="icon-btn danger" data-del="${gi}:${ii}" title="删除">${ICO_TRASH}</button>
 </div>`).join('')}
 <button class="rule-add" data-addthread="${gi}"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>添加线程规则</button>
@@ -488,9 +505,9 @@ function specOf(r){
   if(r.all)return 'all-core';
   return r.sem.join(',');
 }
-const CHIP_HTML=[['e-core','e-core 小核'],['m-core','m-core 中频'],['p-core','p-core 中核'],['hp-core','hp-core 大核'],['all-core','all-core 全部'],['自定义','自定义']]
+const CHIP_HTML=[['hp-core','hp-core 大核'],['p-core','p-core 中核'],['m-core','m-core 中频'],['e-core','e-core 小核'],['all-core','all-core 全部'],['自定义','自定义']]
   .map(([c,t])=>`<button data-core="${c}" title="${t}">${c}</button>`).join('');
-const DYN_CHIP_HTML=[['e-core','e-core 小核'],['m-core','m-core 中频'],['p-core','p-core 中核'],['hp-core','hp-core 大核'],['all-core','all-core 全部']]
+const DYN_CHIP_HTML=[['hp-core','hp-core 大核'],['p-core','p-core 中核'],['m-core','m-core 中频'],['e-core','e-core 小核'],['all-core','all-core 全部']]
   .map(([c,t])=>`<button data-core="${c}" title="${t}">${c}</button>`).join('');
 function applyRowTopo(el){
   const vis=semanticVisible();
