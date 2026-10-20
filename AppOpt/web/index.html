@@ -29,7 +29,11 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .badge.proc{background:rgba(0,122,255,.13);color:#0062cc}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .stat{background:var(--bg);border-radius:12px;padding:12px 8px;text-align:center}
-.stat .num{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums}
+.stat .num{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums;height:1em;line-height:1em;overflow:hidden;display:flex;align-items:center;justify-content:center;gap:1px}
+.num .dig{display:flex;flex-direction:column;transform:translateY(calc(-1em*var(--d,0)));transition:transform .5s cubic-bezier(.22,1.15,.36,1)}
+.num .dig i{height:1em;line-height:1em;font-style:normal;flex-shrink:0}
+@keyframes numIn{from{opacity:0;transform:translateY(.55em)}to{opacity:1;transform:none}}
+.num.num-in{animation:numIn .3s cubic-bezier(.2,1.2,.4,1) both}
 .stat .lbl{font-size:12px;color:var(--sub);margin-top:2px}
 .chip{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;font-family:var(--mono);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chip.e{background:rgba(52,199,89,.15);color:#248a3d}
@@ -43,7 +47,8 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .tab{flex:1;color:var(--sub);font-size:11px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;transition:color .15s}
 .tab svg{width:24px;height:24px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;transition:transform .15s}
 .tab.active{color:var(--blue)}
-.tab.active svg{transform:translateY(-1px) scale(1.08)}
+.tab.active svg{transform:translateY(-1px) scale(1.08);animation:tabPop .38s cubic-bezier(.2,1.35,.4,1)}
+@keyframes tabPop{0%{transform:translateY(0) scale(1)}45%{transform:translateY(-3px) scale(1.22)}100%{transform:translateY(-1px) scale(1.08)}}
 @media(orientation:landscape){.app{flex-direction:row}.tabbar{flex-direction:column;height:100%;width:64px;border-top:none;border-right:1px solid var(--border);order:-1;justify-content:center;padding-bottom:0}.tab{flex:1;max-height:64px}}
 .bar{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;gap:8px}
 #r-filter{flex:1;min-width:0;width:auto;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:8px 12px;font-size:13px;color:var(--fg);outline:none;font-family:inherit}
@@ -99,6 +104,8 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .sg-item{padding:9px 12px;font-size:13px;word-break:break-all}
 .sg-item.hl,.sg-item:active{background:rgba(0,122,255,.08)}
 .tree-row{margin-bottom:12px}
+@keyframes rowUp{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}
+.tree-row.row-in{animation:rowUp .3s cubic-bezier(.2,1.2,.4,1) both}
 .tree-row.branch{border-left:2px solid rgba(0,122,255,.25);padding-left:10px}
 .tr-head{display:flex;align-items:center;gap:6px;margin-bottom:6px}
 .tr-head input{flex:1;width:auto;min-width:0;margin-bottom:0}
@@ -120,8 +127,10 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .entry{display:flex;width:100%;align-items:center;gap:8px;padding:11px 0;font-size:14px}
 .entry svg{margin-left:auto;width:14px;height:14px;stroke:var(--sub);fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
 .entry:active{opacity:.5}
-.page{position:absolute;inset:0;background:var(--bg);z-index:50;display:flex;flex-direction:column;transform:translateX(100%);transition:transform .18s ease;pointer-events:none}
+.page{position:absolute;inset:0;background:var(--bg);z-index:50;display:flex;flex-direction:column;transform:translateX(101%);transition:transform .32s cubic-bezier(.32,.72,.24,1.08);pointer-events:none;box-shadow:-6px 0 18px rgba(0,0,0,.07)}
 .page.show{transform:none;pointer-events:auto}
+.main,.tabbar{transition:transform .32s cubic-bezier(.32,.72,.24,1.08)}
+.app.pushing .main,.app.pushing .tabbar{transform:translateX(-24%)}
 .navbar{display:flex;align-items:center;justify-content:center;position:relative;height:44px;flex-shrink:0;border-bottom:1px solid var(--border)}
 .nav-title{font-size:16px;font-weight:600}
 .back{position:absolute;left:6px;top:0;height:100%;display:flex;align-items:center;gap:2px;color:var(--blue);font-size:15px;padding:0 8px}
@@ -312,6 +321,24 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
 
 function startStat(){stopStat();refreshStat();statTimer=setInterval(refreshStat,3000)}
 function stopStat(){if(statTimer){clearInterval(statTimer);statTimer=null}}
+function setNum(el,v){
+  const s=String(v);
+  if(el.dataset.v===s)return;
+  el.dataset.v=s;
+  const cols=[...s].map(d=>`<span class="dig" style="--d:${d}" data-cur="${d}"><i>0</i><i>1</i><i>2</i><i>3</i><i>4</i><i>5</i><i>6</i><i>7</i><i>8</i><i>9</i></span>`).join('');
+  if(el.childElementCount!==s.length){
+    el.innerHTML=cols;
+    el.classList.remove('num-in');void el.offsetWidth;el.classList.add('num-in');
+    return;
+  }
+  [...el.children].forEach((c,i)=>{
+    const cur=+(c.dataset.cur||0),d=+s[i];
+    c.dataset.cur=d;
+    if(d===cur)return;
+    if(d<cur){c.style.transition='none';c.style.setProperty('--d',cur+10);void c.offsetWidth;c.style.transition=''}
+    c.style.setProperty('--d',d);
+  });
+}
 async function refreshStat(){
   if(document.hidden)return;
   try{
@@ -321,15 +348,15 @@ async function refreshStat(){
     mb.className='badge '+(d.mode==='ebpf'?'ebpf':'proc');
     $('s-up').textContent=fmtUp(d.uptime);
     $('s-ver').textContent='v'+(d.version||'?');
-    $('s-rules').textContent=d.rules;
-    $('s-pkgs').textContent=d.pkgs;
     const pf=+d.parse_fail||0;
+    setNum($('s-rules'),d.rules);
+    setNum($('s-pkgs'),d.pkgs);
     $('s-pf').hidden=!pf;
     $('s-pf').textContent=pf?pf+' 行规则因格式无效被跳过，请检查配置文件':'';
-    $('s-hit').textContent=d.hit_pkgs;
-    $('s-threads').textContent=d.threads;
-    $('s-procs').textContent=d.total_procs;
-    $('s-cores').textContent=d.cores;
+    setNum($('s-hit'),d.hit_pkgs);
+    setNum($('s-threads'),d.threads);
+    setNum($('s-procs'),d.total_procs);
+    setNum($('s-cores'),d.cores);
     $('s-ecore').textContent=d.e_core||'无';
     $('s-mcore').textContent=d.m_core||'无';
     $('s-pcore').textContent=d.p_core||'无';
@@ -497,7 +524,7 @@ function updateRowDyn(el,r){
   el.querySelector('.rr-thr').value=r.dynThr;
 }
 let mrRows=[];
-function renderRows(){
+function renderRows(anim){
   const box=$('mr-rows'),tree=isTree();
   box.innerHTML=mrRows.map((r,i)=>`
 <div class="tree-row${r.pkgRow?'':' branch'}" data-ri="${i}">
@@ -516,6 +543,8 @@ ${r.pkgRow
 <div class="field dyn-thr"><span class="tr-tag">阈值 %</span><input class="rr-thr" type="number" min="1" max="100"><span class="tr-sub">负载超过时绑第一档</span></div>
 </div>
 </div>`).join('');
+  if(anim==='all')mrRows.forEach((r,i)=>{const el=box.children[i];el.classList.add('row-in');el.style.animationDelay=(i*35)+'ms'});
+  else if(anim==='last'&&mrRows.length)box.lastElementChild.classList.add('row-in');
   mrRows.forEach((r,i)=>{
     const el=box.children[i];
     applyRowTopo(el);updateRowChips(el,r);
@@ -566,7 +595,7 @@ $('mr-rows').addEventListener('input',e=>{
   if(e.target.classList.contains('dyn-tier-input'))r.dynT[+e.target.dataset.ti]=e.target.value;
   if(e.target.classList.contains('rr-thr'))r.dynThr=e.target.value;
 });
-$('mr-addrow').onclick=()=>{mrRows.push(mkRow({}));renderRows();const m=$('mr-addrow').closest('.modal');m.scrollTop=m.scrollHeight};
+$('mr-addrow').onclick=()=>{mrRows.push(mkRow({}));renderRows('last');const m=$('mr-addrow').closest('.modal');m.scrollTo({top:m.scrollHeight,behavior:'smooth'})};
 let mrMode='add-pkg',mrOldThread='',mrOldPkg='',mrOldThreads=new Set(),mrHadPkgRule=false;
 const isTree=()=>mrMode==='add-pkg'||mrMode==='edit-app';
 async function openRuleModal(mode,gi,ii){
@@ -600,7 +629,7 @@ async function openRuleModal(mode,gi,ii){
     mrOldThread=rulesData[gi].items[ii].thread;
     mrRows=[mkRow({thread:mrOldThread,...parseSpec(rulesData[gi].items[ii].spec)})];
   }
-  renderRows();
+  renderRows('all');
   $('modal-rule').hidden=false;
 }
 $('r-add').onclick=()=>openRuleModal('add-pkg');
@@ -741,9 +770,10 @@ $('c-file-save').onclick=()=>saveField({config_file:$('c-file').value.trim()});
 
 $('c-about').onclick=async()=>{
   $('page-about').classList.add('show');
+  document.querySelector('.app').classList.add('pushing');
   try{const d=await api('/api/status');$('a-ver').textContent='v'+d.version}catch(e){}
 };
-$('about-back').onclick=()=>$('page-about').classList.remove('show');
+$('about-back').onclick=()=>{$('page-about').classList.remove('show');document.querySelector('.app').classList.remove('pushing')};
 
 startStat();
 </script>

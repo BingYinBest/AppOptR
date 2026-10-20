@@ -70,11 +70,17 @@ fn print_help(prog_name: &str) {
     println!();
     println!("规则格式:");
     println!("  # 注释以 # 或 // 开头");
-    println!("  com.example=0-3           包级规则，绑定到 CPU 0-3");
-    println!("  com.example=e-core        语义核心，绑定到全部小核");
-    println!("  com.example=m-core        语义核心，绑定到中频档（4 档及以上芯片的第二档）");
-    println!("  com.example=p-core        语义核心，绑定到全部中核");
-    println!("  com.example=hp-core       语义核心，绑定到全部大核");
+    println!("  com.example=0-3                包级规则，绑定到 CPU 0-3");
+    println!("  com.example:push=0-3           子进程规则，限定 :push 子进程");
+    println!("  com.example{{RenderThread}}=0-3  线程规则，绑定指定线程（支持 * ? [] 通配）");
+    println!();
+    println!("  语义核心（按 cpufreq 频率分组推断），可逗号组合：");
+    println!("    e-core     能效小核");
+    println!("    m-core     中频档（4 档及以上芯片的第二档）");
+    println!("    p-core     性能中核");
+    println!("    hp-core    高性能大核");
+    println!("    all-core   所有核心");
+    println!("    示例: com.example=e-core,p-core");
     println!();
     println!("  块语法，包级规则 + 线程规则");
     println!("  com.example {{");
@@ -87,7 +93,8 @@ fn print_help(prog_name: &str) {
     println!("  动态规则（按负载自动选择）：");
     println!("    Thread-*=elect(6-7 | 0-5)    组内负载最高线程绑 6-7，其余绑 0-5");
     println!("    Thread-*=load(7 | 4-6 | 50)  单线程负载>50% 绑 7，否则绑 4-6");
-    println!("  动态规则优先于同包静态线程规则，档位切换带滞回防抖（5s 驻留）");
+    println!("  动态规则优先于同包静态线程规则，组内线程不参与静态合并；");
+    println!("  elect 换人需超现任 20% 且驻留 5s，load 阈值带 5% 滞回，切换均需驻留 5s 防抖");
 }
 
 /// 主循环运行状态，收敛主循环内的全部局部状态

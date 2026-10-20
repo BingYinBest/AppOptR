@@ -6,8 +6,8 @@ AppOptR（线程优化）：Android 应用线程 CPU 亲和性管理工具，以
 
 - `AppOpt/` — 用户态主程序（bin 名 AppOpt，Rust 2024 edition）。`web/index.html` 经 `include_str!` 编译期内嵌，**改面板须改此文件并重新编译主程序**。
 - `AppOpt-ebpf/` — 内核态 eBPF（aya-ebpf，no_std）。编译产物是 BPF ELF 对象，运行时由主程序在自身同目录按文件名 `AppOpt-ebpf` 加载，缺失自动回退 /proc 轮询。
-- `module/` — 模块包：`module.prop` 是版本真相来源；`bin/<arch>/` 放预编译产物；`customize.sh`/`service.sh` 是安装/自启脚本。
-- `modules_update/` — 发布 zip（`线程优化vX.Y.Z.zip`）与 `changelog.md`。
+- `module/` — 模块包：`module.prop` 是版本真相来源；`bin/<arch>/` 放预编译产物；`customize.sh`/`service.sh` 是安装/自启脚本；`webroot/index.html` 只是跳转到 127.0.0.1:8889 的入口页（**面板本体唯一在 `AppOpt/web/index.html`**，勿改这里）；`applist.conf` 是随包示例规则，安装时与旧配置合并（见 `customize.sh::copy_default_rules`）。
+- `modules_update/` — 发布 zip（`线程优化vX.Y.Z.zip`）与 `changelog.md`；**zip 与 `module/bin/` 预编译产物均随 git 提交入库**。
 
 ## 构建与验证
 
@@ -17,12 +17,12 @@ AppOptR（线程优化）：Android 应用线程 CPU 亲和性管理工具，以
 - `./build.sh` = host 回归 → aarch64/x86_64 交叉编译 → eBPF 字节码 → 打包 zip 到 `modules_update/`，产物自动覆盖 `module/bin/`。主程序必须 64 位（32 位 target 触发 `compile_error!`，依赖 `cpu_set_t` 布局）。
 - `AppOpt-ebpf` 按 aya 标准用 nightly 以 `bpfel-unknown-none` + `-Z build-std=core` 编译，不是可执行文件；release `opt-level=2`（旧 `s` 不再被新版 bpf-linker 的 LLVM 接受，勿改回）。
 - 交叉编译环境已装好（rustup stable+nightly、NDK r30、bpf-linker v0.11.1），`scripts/env.sh` 统一配置并 `check_env` 校验，缺工具时按它的提示补齐。NDK 默认路径 `/root/android/ndk/android-ndk-r30`，可用 `NDK` 环境变量覆盖（CI 用的是 GitHub runner 自带 NDK）。
-- CI（`.github/workflows/release.yml`）仅在推送 `v*` tag 或手动触发时运行：test job 跑 host 测试+clippy，package job 复现交叉编译并调 `scripts/package.sh` 产出 zip；日常改动不触发 CI。
-- **注意：`AppOpt/Cargo.toml` 的 crate 版本是历史遗留（当前 2.2.6），与模块版本（2.3.x）不同步；发布时只 bump 模块版本，勿顺手改 Cargo.toml。**（面板「版本」显示的是 CARGO_PKG_VERSION）
+- CI（`.github/workflows/release.yml`）仅在推送 `v*` tag 或手动触发时运行：test job 跑 host 测试+clippy，package job 内联复现交叉编译；日常改动不触发 CI。**`scripts/` 与 `build.sh` 被 `.gitignore` 忽略、从未提交入库（工作区本地专属，新 clone 后不存在）——CI checkout 后没有 `scripts/package.sh`，package job 的打包步骤实际会失败；发布 zip 只在本地/容器产出，CI 只承担交叉编译验证。**
+- **注意：`AppOpt/Cargo.toml` 的 crate 版本是历史遗留（当前 2.2.6），与模块版本（2.3.1）不同步；发布时只 bump 模块版本，勿顺手改 Cargo.toml。**（面板「版本」显示的是 CARGO_PKG_VERSION）
 
 ## 发布规则
 
-- 每次发布必须提升版本：`scripts/bump-version.sh`（无参 = versionCode+1；带参如 `2.3.2` = 改 version 且 versionCode+1），并同步 `modules_update/changelog.md`（README 无版本字段，无需动）。
+- 每次发布必须提升版本：`scripts/bump-version.sh`（无参 = versionCode+1；带参如 `2.3.2` = 改 version 且 versionCode+1），并同步 `modules_update/changelog.md`。`bump-version.sh` 与 `build.sh` 的提示文案都提到「同步 README.md 版本信息」，但 README 实际无版本字段，无需动。
 - 仅改版本时重跑 `scripts/package.sh` 即可重新打包，无需重编译；打包依赖系统 `zip`。
 
 ## 运行时行为
