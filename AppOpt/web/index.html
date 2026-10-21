@@ -485,8 +485,8 @@ function parseSpec(spec){
   const m=spec.match(DYN_RE);
   if(m){
     const t=m[2].split('|').map(s=>s.trim());
-    if(m[1]==='elect'&&t.length===2)return{dyn:true,dynMode:'elect',dynT:t};
-    if(m[1]==='load'&&t.length===3)return{dyn:true,dynMode:'load',dynT:t.slice(0,2),dynThr:+t[2]||50};
+    if(m[1]==='elect'&&t.length===2)return{dyn:true,dynMode:'elect',dynT:t,dynCustom:t.map(v=>!!v&&!DYN_KEYS.includes(v))};
+    if(m[1]==='load'&&t.length===3)return{dyn:true,dynMode:'load',dynT:t.slice(0,2),dynThr:+t[2]||50,dynCustom:t.slice(0,2).map(v=>!!v&&!DYN_KEYS.includes(v))};
   }
   const vis=semanticVisible();
   const parts=spec.split(',').map(s=>s.trim()).filter(Boolean);
@@ -495,7 +495,7 @@ function parseSpec(spec){
   if(parts.length&&sem.length===parts.length)return{sem};
   return{custom:true,customVal:spec};
 }
-const mkRow=o=>({thread:'',sem:[],all:false,custom:false,customVal:'',dyn:false,dynMode:'elect',dynT:['',''],dynThr:50,...o});
+const mkRow=o=>({thread:'',sem:[],all:false,custom:false,customVal:'',dyn:false,dynMode:'elect',dynT:['',''],dynCustom:[false,false],dynThr:50,...o});
 function specOf(r){
   if(r.dyn){
     const t=r.dynT.map(s=>s.trim());
@@ -507,8 +507,10 @@ function specOf(r){
 }
 const CHIP_HTML=[['hp-core','hp-core 大核'],['p-core','p-core 中核'],['m-core','m-core 中频'],['e-core','e-core 小核'],['all-core','all-core 全部'],['自定义','自定义']]
   .map(([c,t])=>`<button data-core="${c}" title="${t}">${c}</button>`).join('');
-const DYN_CHIP_HTML=[['hp-core','hp-core 大核'],['p-core','p-core 中核'],['m-core','m-core 中频'],['e-core','e-core 小核'],['all-core','all-core 全部']]
+const DYN_CHIP_HTML=[['hp-core','hp-core 大核'],['p-core','p-core 中核'],['m-core','m-core 中频'],['e-core','e-core 小核'],['all-core','all-core 全部'],['自定义','自定义 CPU 范围或档位名']]
   .map(([c,t])=>`<button data-core="${c}" title="${t}">${c}</button>`).join('');
+const DYN_KEYS=['hp-core','p-core','m-core','e-core','all-core'];
+const isDynSemantic=v=>DYN_KEYS.includes(v);
 function applyRowTopo(el){
   const vis=semanticVisible();
   el.querySelectorAll('.core-chips:not(.dyn-tier-chips) button').forEach(b=>{
@@ -534,10 +536,14 @@ function updateRowDyn(el,r){
   el.querySelectorAll('.dyn-seg button').forEach(b=>b.classList.toggle('on',b.dataset.dm===r.dynMode));
   el.querySelector('.dyn-thr').hidden=r.dynMode!=='load';
   r.dynT.forEach((v,i)=>{
-    el.querySelector(`.dyn-tier-input[data-ti="${i}"]`).value=v;
-    el.querySelector(`.dyn-tier-chips[data-ti="${i}"]`).querySelectorAll('button').forEach(b=>{
-      b.hidden=b.dataset.core==='m-core'&&!semanticVisible().includes('m-core');
-      b.classList.toggle('on',b.dataset.core===v);
+    const tierEl=el.querySelector(`.dyn-tier-chips[data-ti="${i}"]`);
+    const input=el.querySelector(`.dyn-tier-input[data-ti="${i}"]`);
+    input.value=v;
+    const custom=!!(r.dynCustom[i]||(v&&!isDynSemantic(v)));
+    input.hidden=!custom;
+    tierEl.querySelectorAll('button').forEach(b=>{
+      b.hidden=CORE_KEYS.includes(b.dataset.core)&&!semanticVisible().includes(b.dataset.core);
+      b.classList.toggle('on',b.dataset.core==='自定义'?custom:b.dataset.core===v);
     });
   });
   el.querySelector('.rr-thr').value=r.dynThr;
@@ -584,7 +590,8 @@ $('mr-rows').addEventListener('click',e=>{
   if(tc){
     const chipsEl=tc.closest('.dyn-tier-chips');
     const el=chipsEl.closest('[data-ri]'),r=mrRows[+el.dataset.ri],ti=+chipsEl.dataset.ti;
-    r.dynT[ti]=r.dynT[ti]===tc.dataset.core?'':tc.dataset.core;
+    if(tc.dataset.core==='自定义'){if(isDynSemantic(r.dynT[ti]))r.dynT[ti]='';r.dynCustom[ti]=true}
+    else{r.dynT[ti]=r.dynT[ti]===tc.dataset.core?'':tc.dataset.core;r.dynCustom[ti]=false}
     updateRowDyn(el,r);
     return;
   }
