@@ -160,7 +160,7 @@ fn ebpf_event_step(
         affinity_check(es, cfg);
         *affinity_deadline = Instant::now();
     }
-    if dyn_deadline.elapsed() >= Duration::from_secs(5 * interval) {
+    if dyn_deadline.elapsed() >= Duration::from_secs(interval) {
         dyn_eval(cfg, &mut es.cache);
         *dyn_deadline = Instant::now();
     }
@@ -183,7 +183,7 @@ fn proc_cycle(
         *affinity_deadline = Instant::now();
         cache.force_affinity = false;
     }
-    if dyn_deadline.elapsed() >= Duration::from_secs(5 * interval) {
+    if dyn_deadline.elapsed() >= Duration::from_secs(interval) {
         dyn_eval(cfg, &mut cache.cache);
         *dyn_deadline = Instant::now();
     }
