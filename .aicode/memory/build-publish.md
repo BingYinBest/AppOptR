@@ -7,14 +7,14 @@ description: AppOpt 发布流程已脚本化：./build.sh 一键（host 测试�
 - 一键发布：仓库根 `./build.sh`（host cargo test+release → scripts/build-android.sh → scripts/build-ebpf.sh → scripts/package.sh 打 zip 到 modules_update/）。
 - 分步脚本在 `scripts/`：env.sh（公共环境+检测）、build-android.sh、build-ebpf.sh、package.sh、bump-version.sh（versionCode+1，可带版本参数）。
 - CI：.github/workflows/release.yml（tag v* 或手动触发，runner 自带 NDK）。
-- 交叉编译工具链（已装于本容器）：rustup 在 ~/.cargo（stable + nightly/rust-src），Android target aarch64/x86_64-linux-android 已 add；bpf-linker v0.11.1 在 ~/.local/bin；链接器用 NDK r30 的 aarch64/x86_64-linux-android24-clang（/root/android/ndk/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/bin）。
+- 交叉编译工具链（环境重置后已重装于本容器）：rustup 在 ~/.cargo（stable 1.99.1 + nightly 1.101.0，nightly 带 rust-src），Android target aarch64/x86_64-linux-android 已 add；bpf-linker v0.13.0（GitHub 预编译 musl 静态版）在 ~/.cargo/bin/bpf-linker；链接器用 NDK r30 custom 的 aarch64/x86_64-linux-android24-clang（/root/android-sdk/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-arm64/bin，aarch64 宿主原生）。env.sh 三处路径已同步，build.sh 已加 source env.sh，check_env 与全量 build 已验证通过。
 - eBPF 编译：`cargo +nightly build --release --target bpfel-unknown-none -Z build-std=core`（env.sh 已 export CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER）。
 - 注意：AppOpt-ebpf 的 [profile.release] opt-level 必须用整数 2（原 "s" 会被新版 bpf-linker 的 LLVM 拒绝报 -Os 不支持；字符串 "2" 在该 nightly cargo 也会被误报非法，整数 2 正常）。勿改回 "s"。
 - 发布仍需人工同步：module/module.prop 版本、changelog.md、README.md。
 
 # AppOpt 测试
 
-- 单元测试（AppOpt 目录 `cargo test`，58 项）：config 解析纯函数（parse_rules/parse_outer/spec_like 等）、cpuset 解析（parse_cpu_spec/to_range_string）、rule_match 匹配、rule_edit 文本增删改（用 /tmp 临时文件）。
+- 单元测试（AppOpt 目录 `cargo test`，83 项）：config 解析纯函数（parse_rules/parse_outer/spec_like 等）、cpuset 解析（parse_cpu_spec/to_range_string）、rule_match 匹配、rule_edit 文本增删改（用 /tmp 临时文件）。
 - parse_rules 是纯函数（不触盘），fixture 用 include_str!("../../module/applist.conf")。
 - 测试拓扑一律 cpuset_enabled=false 避免碰 /dev/cpuset。
 - host 编译注意：libc::inotify_rm_watch 第二参数 Android 是 u32、Linux 是 i32，交叉平台写法用 `as _`。

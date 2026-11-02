@@ -4,6 +4,8 @@ set -e
 
 cd "$(dirname "$0")"
 
+. scripts/env.sh
+
 chmod +x scripts/*.sh
 
 echo "==== 1/4 host 测试与构建验证 ===="

@@ -11,13 +11,13 @@ AppOptR（线程优化）：Android 应用线程 CPU 亲和性管理工具，以
 
 ## 构建与验证
 
-- 工具链：`cargo`/`rustc` 系统版在 PATH（`/usr/bin`，rust 1.93），host 单测/release 可直接跑；交叉编译与 eBPF 需要 rustup stable/nightly + NDK linker，由 `scripts/env.sh` 提供——`build-android.sh`/`build-ebpf.sh`/`package.sh` 内部均 `source env.sh`，故 `./build.sh` 可直接执行。手动跑非 host 目标或 rustup 子命令时，先 `bash -c 'source scripts/env.sh && ...'`。
-- host 单测：`cd AppOpt && cargo test`（覆盖配置解析/规则匹配/文本编辑/cpuset/缓存，不依赖 Android target 与真机）。
-- lint：`cd AppOpt && cargo clippy --all-targets -- -D warnings`（当前零警告，容器内 clippy 已装可直接跑）。
+- 工具链（本容器已重装，与历史记录不同）：rustup 管理，stable 1.99.1 + nightly 1.101.0（aarch64 host），`~/.cargo/bin` 需经 `source ~/.cargo/env` 或 `bash -c 'source scripts/env.sh && ...'` 进入 PATH。host 单测/release 可直接跑；交叉编译与 eBPF 由 `scripts/env.sh` 提供，`build.sh`/`build-android.sh`/`build-ebpf.sh`/`package.sh` 内部均 `source env.sh`。
+- host 单测：`cd AppOpt && cargo test`（83 个用例通过，覆盖配置解析/规则匹配/文本编辑/cpuset/缓存，不依赖 Android target 与真机）。
+- lint：`cd AppOpt && cargo clippy --all-targets -- -D warnings`；当前 minimal profile 未含 clippy 组件，第一次跑前先 `rustup component add clippy`。
 - `./build.sh` = host 回归 → aarch64/x86_64 交叉编译 → eBPF 字节码 → 打包 zip 到 `modules_update/`，产物自动覆盖 `module/bin/`。主程序必须 64 位（32 位 target 触发 `compile_error!`，依赖 `cpu_set_t` 布局）。
-- `AppOpt-ebpf` 按 aya 标准用 nightly 以 `bpfel-unknown-none` + `-Z build-std=core` 编译，不是可执行文件；release `opt-level=2`（旧 `s` 不再被新版 bpf-linker 的 LLVM 接受，勿改回）。
-- 交叉编译环境已装好（rustup stable+nightly、NDK r30、bpf-linker v0.11.1），`scripts/env.sh` 统一配置并 `check_env` 校验，缺工具时按它的提示补齐。NDK 默认路径 `/root/android/ndk/android-ndk-r30`，可用 `NDK` 环境变量覆盖。
-- Cargo.toml 版本规则：`AppOpt/Cargo.toml` 必须与模块版本一致（面板「版本」显示的是 CARGO_PKG_VERSION）；`AppOpt-ebpf/Cargo.toml` 与之独立，按改动复杂度更新（大改升主/次版本，小改小幅升）。
+- `AppOpt-ebpf` 按 aya 标准用 nightly 以 `bpfel-unknown-none` + `-Z build-std=core` 编译（nightly 需带 rust-src 组件，build-ebpf.sh 依赖它），不是可执行文件；release `opt-level=2`（旧 `s` 不再被新版 bpf-linker 的 LLVM 接受，勿改回）。
+- **`scripts/env.sh` 默认值与当前环境不一致，跑构建前必须先适配**：NDK 实际在 `/root/android-sdk/ndk/30.0.16248370`（custom aarch64 构建，prebuilt 目录是 `linux-arm64`），bpf-linker 0.13.0 在 `~/.cargo/bin/bpf-linker`（GitHub 预编译 musl 静态版）；而 `env.sh` 仍写 `/root/android/ndk/android-ndk-r30`、`linux-x86_64`、`~/.local/bin/bpf-linker`，`check_env` 会因此失败。需同步 `env.sh` 的 `NDK`/`NDK_BIN`/`CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER` 三处（或用 `NDK` 环境变量覆盖路径、并手动把 `NDK_BIN` 的架构段改为 `linux-arm64`）。
+- Cargo.toml 版本规则：`AppOpt/Cargo.toml` 必须与模块版本一致（面板「版本」显示的是 CARGO_PKG_VERSION，当前均 2.3.3）；`AppOpt-ebpf/Cargo.toml` 与之独立（当前 0.3.2），按改动复杂度更新（大改升主/次版本，小改小幅升）。
 
 ## 发布规则
 
