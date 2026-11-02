@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::apply_affinity::{proc_snapshot, read_cmdline, task_tids, tid_comm};
@@ -8,7 +8,7 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct ProcScanState {
     pub cache: ProcCache,
-    pub tracked_pids: HashSet<i32>,
+    pub tracked_pids: HashMap<i32, String>,
     pub last_snapshot: HashSet<i32>,
     pub force_affinity: bool,
     last_reconcile: Instant,
@@ -18,7 +18,7 @@ impl ProcScanState {
     pub fn new() -> Self {
         Self {
             cache: ProcCache::new(),
-            tracked_pids: HashSet::new(),
+            tracked_pids: HashMap::new(),
             last_snapshot: HashSet::new(),
             force_affinity: false,
             last_reconcile: Instant::now(),
@@ -39,13 +39,20 @@ pub fn proc_diff(cfg: &AppConfig, state: &mut ProcScanState) {
     let mut changed = false;
     let removed: HashSet<i32> = state.last_snapshot.difference(&snapshot).copied().collect();
     if !removed.is_empty() {
-        state.tracked_pids.retain(|pid| !removed.contains(pid));
+        state.tracked_pids.retain(|pid, _| !removed.contains(pid));
         state.cache.remove_pkgs(&removed);
         changed = true;
     }
     let reconcile = state.last_reconcile.elapsed() >= RECONCILE_INTERVAL;
+    if reconcile {
+        state.last_reconcile = Instant::now();
+    }
     let candidates: Vec<i32> = if reconcile {
-        snapshot.difference(&state.tracked_pids).copied().collect()
+        snapshot
+            .iter()
+            .filter(|p| !state.tracked_pids.contains_key(p))
+            .copied()
+            .collect()
     } else {
         snapshot.difference(&state.last_snapshot).copied().collect()
     };
@@ -56,27 +63,35 @@ pub fn proc_diff(cfg: &AppConfig, state: &mut ProcScanState) {
         if !cfg.pkgs.contains(&pkg) {
             continue;
         }
-        state.tracked_pids.insert(pid);
+        state.tracked_pids.insert(pid, pkg.clone());
         if proc_tasks(pid, &pkg, cfg, &mut state.cache) {
             changed = true;
         }
     }
     if reconcile {
-        state.last_reconcile = Instant::now();
-    }
-    let tracked: Vec<i32> = state.tracked_pids.iter().copied().collect();
-    for pid in tracked {
-        let Some(pkg) = read_cmdline(pid).or_else(|| tid_comm(pid)) else {
-            continue;
-        };
-        if !cfg.pkgs.contains(&pkg) {
-            state.tracked_pids.remove(&pid);
-            state.cache.remove_pkgs(&HashSet::from([pid]));
-            changed = true;
-            continue;
+        let tracked: Vec<(i32, String)> = state.tracked_pids.clone().into_iter().collect();
+        for (pid, pkg) in tracked {
+            match read_cmdline(pid).or_else(|| tid_comm(pid)) {
+                Some(p) if cfg.pkgs.contains(&p) => {
+                    if p != pkg {
+                        state.tracked_pids.insert(pid, p.clone());
+                    }
+                    if proc_tasks(pid, &p, cfg, &mut state.cache) {
+                        changed = true;
+                    }
+                }
+                _ => {
+                    state.tracked_pids.remove(&pid);
+                    state.cache.remove_pkgs(&HashSet::from([pid]));
+                    changed = true;
+                }
+            }
         }
-        if proc_tasks(pid, &pkg, cfg, &mut state.cache) {
-            changed = true;
+    } else {
+        for (pid, pkg) in &state.tracked_pids {
+            if proc_tasks(*pid, pkg, cfg, &mut state.cache) {
+                changed = true;
+            }
         }
     }
 
@@ -89,17 +104,24 @@ fn proc_tasks(pid: i32, pkg: &str, cfg: &AppConfig, cache: &mut ProcCache) -> bo
     let Some(tids) = task_tids(pid) else { return false };
     let live: HashSet<i32> = tids.iter().copied().collect();
     let old: HashSet<i32> = cache
-        .tasks
-        .iter()
-        .filter(|(_, e)| e.pid == pid)
-        .map(|(tid, _)| *tid)
-        .collect();
+        .by_pid
+        .get(&pid)
+        .map(|v| v.iter().copied().collect())
+        .unwrap_or_default();
     if old == live {
         return false;
     }
     for tid in &tids {
         let thread_name = if has_thread_rules {
-            tid_comm(*tid).unwrap_or_default()
+            if old.contains(tid) {
+                cache
+                    .tasks
+                    .get(tid)
+                    .map(|e| e.comm.clone())
+                    .unwrap_or_default()
+            } else {
+                tid_comm(*tid).unwrap_or_default()
+            }
         } else {
             String::new()
         };

@@ -6,6 +6,8 @@ cd "$(dirname "$0")"
 
 . scripts/env.sh
 
+command -v cargo >/dev/null 2>&1 || { echo "缺少 cargo（请先 rustup toolchain install stable）"; exit 1; }
+
 chmod +x scripts/*.sh
 
 echo "==== 1/4 host 测试与构建验证 ===="

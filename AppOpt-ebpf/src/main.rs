@@ -44,6 +44,9 @@ static APPLIED_MAP: LruHashMap<u32, u64> = LruHashMap::with_max_entries(APPLIED_
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 #[map]
+static DROPPED_COUNT: HashMap<u32, u32> = HashMap::with_max_entries(1, 0);
+
+#[map]
 static OFFSETS_MAP: Array<TracepointOffsets> = Array::with_max_entries(1, 0);
 
 #[inline(always)]
@@ -86,6 +89,12 @@ fn submit_event(event: ProcEvent) {
     if let Some(mut entry) = EVENTS.reserve(0) {
         entry.write(event);
         entry.submit(0);
+    } else {
+        unsafe {
+            if let Some(c) = DROPPED_COUNT.get_ptr_mut(&0) {
+                *c = (*c).saturating_add(1);
+            }
+        }
     }
 }
 

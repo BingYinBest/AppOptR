@@ -27,7 +27,7 @@ use crate::config::{
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::dynamic::dyn_eval;
 use crate::ebpf_mode::{
-    affinity_check, full_scan, event_dispatch, comm_map_init,
+    affinity_check, dropped_take, full_scan, event_dispatch, comm_map_init,
     ebpf_init, EbpfState,
 };
 use crate::proc_mode::{proc_diff, ProcScanState};
@@ -148,6 +148,10 @@ fn ebpf_event_step(
                 for event in &batch {
                     event_dispatch(event, cfg, es);
                 }
+            }
+            let dropped = dropped_take(&mut es.bpf);
+            if dropped > 0 {
+                eprintln!("eBPF: 事件溢出丢弃 {} 条（RingBuf 满载，请关注事件风暴）", dropped);
             }
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -308,8 +312,7 @@ fn main() {
     CHECK_INTERVAL.store(sleep_interval, Ordering::Release);
     MODE_FORCE.store(st.mode, Ordering::Release);
 
-    let mut tmp_mtime: i64 = -1;
-    let initial_config = match load_config(&config_file, &topo, &mut tmp_mtime) {
+    let initial_config = match load_config(&config_file, &topo) {
         Some(cfg) => cfg,
         None => {
             eprintln!("初始配置加载失败");

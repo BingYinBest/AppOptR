@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -318,6 +318,7 @@ fn rules_json() -> String {
     let Some(cfg) = current_cfg() else {
         return json!({ "rules": [] }).to_string();
     };
+    let mut spec_cache: HashMap<CpuSet, String> = HashMap::new();
     let mut groups: Vec<serde_json::Value> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for r in &cfg.rules {
@@ -325,10 +326,14 @@ fn rules_json() -> String {
             groups.push(json!({ "pkg": r.pkg, "items": [] }));
             groups.len() - 1
         });
+        let spec = spec_cache
+            .entry(r.cpus)
+            .or_insert_with(|| spec_name(&r.cpus, &cfg.topo))
+            .clone();
         groups[gi]["items"]
             .as_array_mut()
             .unwrap()
-            .push(json!({ "thread": r.thread, "spec": spec_name(&r.cpus, &cfg.topo) }));
+            .push(json!({ "thread": r.thread, "spec": spec }));
     }
     for r in &cfg.dyn_rules {
         let gi = *index.entry(r.pkg.clone()).or_insert_with(|| {
@@ -555,13 +560,18 @@ fn suggest_threads(pkg: &str, q: &str) -> Vec<(String, usize)> {
     rank_top(counts, &q.to_ascii_lowercase())
 }
 
+fn ebpf_probe_cached() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(ebpf_probe)
+}
+
 fn config_json() -> String {
     let stats = lock_ignore_poison(&WEB_STATS).clone();
     let cfg = current_cfg();
     json!({
         "mode": MODE_FORCE.load(Ordering::Relaxed),
         "mode_active": if stats.is_some_and(|s| s.ebpf) { "ebpf" } else { "proc" },
-        "ebpf_available": ebpf_probe(),
+        "ebpf_available": ebpf_probe_cached(),
         "interval": CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
         "cpuset_name": base_cpuset().rsplit('/').next().unwrap_or_default(),
         "config_file": lock_ignore_poison(&CONFIG_FILE).clone(),

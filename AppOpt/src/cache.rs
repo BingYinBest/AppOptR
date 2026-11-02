@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::apply_affinity::affinity_set;
+use crate::apply_affinity::affinity_sync_batch;
 use crate::config::AppConfig;
 use crate::cpuset::{CpuSet, CpuTopology};
 use crate::dynamic::{dyn_group_of, dyn_resolve, DynState};
@@ -17,6 +17,9 @@ pub struct TaskEntry {
 pub struct ProcCache {
     pub tasks: HashMap<i32, TaskEntry>,
     pub dyn_state: DynState,
+    pub by_pid: HashMap<i32, Vec<i32>>,
+    pub dyn_members: HashMap<usize, HashSet<i32>>,
+    pub tid_group: HashMap<i32, usize>,
 }
 
 impl ProcCache {
@@ -24,6 +27,9 @@ impl ProcCache {
         Self {
             tasks: HashMap::with_capacity(64),
             dyn_state: DynState::new(),
+            by_pid: HashMap::new(),
+            dyn_members: HashMap::new(),
+            tid_group: HashMap::new(),
         }
     }
 
@@ -31,19 +37,60 @@ impl ProcCache {
         self.tasks.clear();
         self.dyn_state.tids.clear();
         self.dyn_state.winners.clear();
+        self.by_pid.clear();
+        self.dyn_members.clear();
+        self.tid_group.clear();
     }
 
     pub fn task_del(&mut self, tid: i32) {
-        self.tasks.remove(&tid);
+        if let Some(e) = self.tasks.remove(&tid) {
+            if let Some(tids) = self.by_pid.get_mut(&e.pid) {
+                tids.retain(|&t| t != tid);
+            }
+            self.tid_group_remove(tid);
+        }
+    }
+    fn tid_group_remove(&mut self, tid: i32) {
+        if let Some(gi) = self.tid_group.remove(&tid)
+            && let Some(set) = self.dyn_members.get_mut(&gi)
+        {
+            set.remove(&tid);
+        }
     }
     pub fn remove_pkgs(&mut self, pids: &HashSet<i32>) {
-        self.tasks.retain(|_, e| !pids.contains(&e.pid));
+        for pid in pids {
+            if let Some(tids) = self.by_pid.remove(pid) {
+                for tid in &tids {
+                    self.tasks.remove(tid);
+                    self.tid_group_remove(*tid);
+                }
+            }
+        }
     }
     pub fn retain_pkg_tids(&mut self, pid: i32, live: &HashSet<i32>) {
-        self.tasks.retain(|tid, e| e.pid != pid || live.contains(tid));
+        let Some(mut old) = self.by_pid.remove(&pid) else {
+            return;
+        };
+        for tid in &old {
+            if !live.contains(tid) {
+                self.tasks.remove(tid);
+                self.tid_group_remove(*tid);
+            }
+        }
+        old.retain(|tid| live.contains(tid));
+        if !old.is_empty() {
+            self.by_pid.insert(pid, old);
+        }
+    }
+    pub fn pkg_of(&self, pid: i32) -> Option<String> {
+        self.by_pid
+            .get(&pid)?
+            .iter()
+            .find_map(|tid| self.tasks.get(tid))
+            .map(|e| e.pkg.clone())
     }
     pub fn pkg_lookup_comm(&self, pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
-        comm_to_pkg(pid, comm, cfg).or_else(|| self.tasks.get(&pid).map(|e| e.pkg.clone()))
+        comm_to_pkg(pid, comm, cfg).or_else(|| self.pkg_of(pid))
     }
     pub fn task_apply<F>(
         &mut self,
@@ -62,11 +109,12 @@ impl ProcCache {
         } else {
             ""
         };
-        let result = if let Some((_, spec)) = dyn_group_of(cfg, pkg, thread_name) {
-            Some(dyn_resolve(self, tid, spec, cfg))
-        } else {
-            thread_affinity(pkg, thread_name, cfg)
-        };
+        let (result, group) =
+            if let Some((gi, spec)) = dyn_group_of(cfg, pkg, thread_name) {
+                (Some(dyn_resolve(self, tid, spec, cfg)), Some(gi))
+            } else {
+                (thread_affinity(pkg, thread_name, cfg), None)
+            };
         let Some(result) = result else {
             return false;
         };
@@ -85,10 +133,17 @@ impl ProcCache {
 
         let dead = apply_fn(tid, &result.cpus, &result.cpuset_dir);
         if dead {
-            self.tasks.remove(&tid);
+            self.task_del(tid);
             return false;
         }
 
+        let old_pid = self.tasks.get(&tid).map(|old| old.pid);
+        if let Some(op) = old_pid
+            && op != pid
+            && let Some(tids) = self.by_pid.get_mut(&op)
+        {
+            tids.retain(|&t| t != tid);
+        }
         self.tasks.insert(
             tid,
             TaskEntry {
@@ -100,20 +155,30 @@ impl ProcCache {
                 is_thread_rule: result.is_thread_rule,
             },
         );
+        match self.by_pid.get_mut(&pid) {
+            Some(tids) if !tids.contains(&tid) => tids.push(tid),
+            Some(_) => {}
+            None => {
+                self.by_pid.insert(pid, vec![tid]);
+            }
+        }
+        match group {
+            Some(gi) => {
+                if self.tid_group.get(&tid) != Some(&gi) {
+                    self.tid_group_remove(tid);
+                    self.dyn_members.entry(gi).or_default().insert(tid);
+                    self.tid_group.insert(tid, gi);
+                }
+            }
+            None => self.tid_group_remove(tid),
+        }
         true
     }
     pub fn affinity_sync(&mut self, topo: &CpuTopology) -> Vec<i32> {
-        let dead_tids: Vec<i32> = self
-            .tasks
-            .iter()
-            .filter_map(|(tid, e)| {
-                if affinity_set(*tid, &e.cpus, &e.cpuset_dir, topo) {
-                    Some(*tid)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let dead_tids = affinity_sync_batch(
+            self.tasks.iter().map(|(tid, e)| (*tid, &e.cpus, e.cpuset_dir.as_str())),
+            topo,
+        );
         for tid in &dead_tids {
             self.task_del(*tid);
         }
@@ -191,7 +256,9 @@ mod tests {
             dyn_rules: Vec::new(),
             dyn_by_pkg: HashMap::new(),
             has_dyn_rules: HashSet::new(),
-            cpuset_dirs: Mutex::new(HashSet::new()),
+            cpuset_dirs: Mutex::new(HashMap::new()),
+            comm_prefixes: HashSet::new(),
+            comm_suffixes: HashSet::new(),
         }
     }
 

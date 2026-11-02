@@ -90,6 +90,55 @@ pub fn affinity_set(
 
     false
 }
+pub fn affinity_sync_batch<'a>(
+    items: impl Iterator<Item = (i32, &'a CpuSet, &'a str)>,
+    topo: &CpuTopology,
+) -> Vec<i32> {
+    let mut to_move: Vec<(i32, &CpuSet, &str)> = Vec::new();
+    for (tid, cpus, dir) in items {
+        if CpuSet::get_affinity(tid) != Some(*cpus) {
+            to_move.push((tid, cpus, dir));
+        }
+    }
+    if topo.cpuset_enabled && !to_move.is_empty() {
+        let mut groups: std::collections::HashMap<&str, Vec<i32>> = std::collections::HashMap::new();
+        for (tid, _, dir) in &to_move {
+            groups.entry(dir).or_default().push(*tid);
+        }
+        let base = base_cpuset();
+        for (dir, tids) in &groups {
+            let mut path = [0u8; 256];
+            let mut cur = std::io::Cursor::new(&mut path[..]);
+            if dir.is_empty() {
+                let _ = write!(cur, "{}/tasks", base);
+            } else {
+                let _ = write!(cur, "{}/{}/tasks", base, dir);
+            }
+            let len = cur.position() as usize;
+            let Some(path_str) = std::str::from_utf8(&path[..len]).ok() else {
+                continue;
+            };
+            match fs::OpenOptions::new().append(true).open(path_str) {
+                Ok(mut f) => {
+                    for tid in tids {
+                        let _ = writeln!(f, "{}", tid);
+                    }
+                }
+                Err(e) => eprintln!("警告: cpuset 迁移 {} 失败 ({})", path_str, e),
+            }
+        }
+    }
+    to_move
+        .into_iter()
+        .filter_map(|(tid, cpus, _)| {
+            if let Err(e) = cpus.set_affinity(tid) {
+                (e.raw_os_error() == Some(libc::ESRCH)).then_some(tid)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
 pub(crate) fn proc_snapshot() -> Option<HashSet<i32>> {
     let entries = fs::read_dir("/proc").ok()?;
     Some(

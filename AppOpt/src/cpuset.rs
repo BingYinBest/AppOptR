@@ -29,7 +29,7 @@ pub fn base_cpuset() -> String {
 const _: () = assert!(std::mem::size_of::<CpuSet>() == std::mem::size_of::<libc::cpu_set_t>());
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct CpuSet {
     pub bits: [u64; CPU_WORDS],
 }

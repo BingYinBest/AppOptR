@@ -13,16 +13,16 @@ pub(crate) fn cpuset_dir_cached(cpus: &CpuSet, cfg: &AppConfig) -> String {
     if !cfg.topo.cpuset_enabled {
         return String::new();
     }
-    let dir_name = cpus.to_range_string();
     {
         let dirs = lock_ignore_poison(&cfg.cpuset_dirs);
-        if dirs.contains(&dir_name) {
-            return dir_name;
+        if let Some(dir) = dirs.get(cpus) {
+            return dir.clone();
         }
     }
+    let dir_name = cpus.to_range_string();
     let path = format!("{}/{}", base_cpuset(), dir_name);
     if create_cpuset_dir(&path, &dir_name, &cfg.topo.mems_str) {
-        lock_ignore_poison(&cfg.cpuset_dirs).insert(dir_name.clone());
+        lock_ignore_poison(&cfg.cpuset_dirs).insert(*cpus, dir_name.clone());
         dir_name
     } else {
         String::new()
@@ -103,13 +103,11 @@ pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
     if cfg.pkgs.contains(comm) {
         return Some(comm.to_string());
     }
-    if comm.len() >= 15
-        && cfg
-            .pkgs
-            .iter()
-            .any(|p| p.starts_with(comm) || p.ends_with(comm))
-    {
-        return read_cmdline(pid).filter(|name| cfg.pkgs.contains(name));
+    if comm.len() >= 15 {
+        let key = comm.get(..15).unwrap_or(comm);
+        if cfg.comm_prefixes.contains(key) || cfg.comm_suffixes.contains(key) {
+            return read_cmdline(pid).filter(|name| cfg.pkgs.contains(name));
+        }
     }
     None
 }
@@ -192,7 +190,9 @@ mod tests {
             dyn_rules: Vec::new(),
             dyn_by_pkg: HashMap::new(),
             has_dyn_rules: HashSet::new(),
-            cpuset_dirs: Mutex::new(HashSet::new()),
+            cpuset_dirs: Mutex::new(HashMap::new()),
+            comm_prefixes: HashSet::new(),
+            comm_suffixes: HashSet::new(),
         }
     }
 

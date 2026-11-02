@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
@@ -15,6 +15,7 @@ pub static INOTIFY_FD: AtomicI32 = AtomicI32::new(-1);
 pub static INOTIFY_WD: AtomicI32 = AtomicI32::new(-1);
 pub static CHECK_INTERVAL: AtomicU64 = AtomicU64::new(2);
 pub static FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
+pub static LAST_MTIME: AtomicI64 = AtomicI64::new(-1);
 pub static CONFIG_FILE: Mutex<String> = Mutex::new(String::new());
 
 pub struct AffinityRule {
@@ -57,7 +58,7 @@ pub struct DynRule {
 }
 #[derive(Debug, PartialEq)]
 pub enum ParsedRule {
-    Static { pkg: String, thread: String, cpus: String },
+    Static { pkg: String, thread: String, cpus: String, set: CpuSet },
     Dyn { pkg: String, thread: String, spec: DynSpec },
 }
 
@@ -71,7 +72,9 @@ pub struct AppConfig {
     pub dyn_rules: Vec<DynRule>,
     pub dyn_by_pkg: HashMap<String, Vec<usize>>,
     pub has_dyn_rules: HashSet<String>,
-    pub cpuset_dirs: Mutex<HashSet<String>>,
+    pub cpuset_dirs: Mutex<HashMap<CpuSet, String>>,
+    pub comm_prefixes: HashSet<String>,
+    pub comm_suffixes: HashSet<String>,
 }
 
 pub static CURRENT_CONFIG: Mutex<Option<Arc<AppConfig>>> = Mutex::new(None);
@@ -187,15 +190,6 @@ pub fn parse_outer(p: &str) -> OuterLine<'_> {
     }
 }
 
-fn add_rule(rules: &mut Vec<AffinityRule>, topo: &CpuTopology, pkg: &str, thread: &str, cpus_spec: &str) {
-    let set = parse_cpu_spec(cpus_spec, topo);
-    rules.push(AffinityRule {
-        pkg: pkg.to_string(),
-        thread: thread.to_string(),
-        thread_pattern: CString::new(thread).unwrap_or_default(),
-        cpus: set,
-    });
-}
 pub fn dyn_spec_try(cpus: &str, topo: &CpuTopology) -> Option<DynSpec> {
     let s = cpus.trim();
     if let Some(inner) = s.strip_prefix("elect(").and_then(|r| r.strip_suffix(')')) {
@@ -257,13 +251,15 @@ fn parse_rule_entry(
             spec,
         });
     }
-    if !spec_like(cpus) || parse_cpu_spec(cpus, topo).count() == 0 {
+    let set = parse_cpu_spec(cpus, topo);
+    if !spec_like(cpus) || set.count() == 0 {
         return None;
     }
     Some(ParsedRule::Static {
         pkg: pkg.to_string(),
         thread: thread.to_string(),
         cpus: cpus.to_string(),
+        set,
     })
 }
 fn parse_rules(content: &str, topo: &CpuTopology) -> (Vec<ParsedRule>, usize) {
@@ -375,7 +371,6 @@ fn parse_rules(content: &str, topo: &CpuTopology) -> (Vec<ParsedRule>, usize) {
 pub fn load_config(
     config_file: &str,
     topo: &CpuTopology,
-    last_mtime: &mut i64,
 ) -> Option<AppConfig> {
     let metadata = fs::metadata(config_file).ok()?;
     let mtime = metadata
@@ -385,7 +380,8 @@ pub fn load_config(
         .ok()?
         .as_nanos() as i64;
 
-    if *last_mtime == mtime && *last_mtime != -1 {
+    let last = LAST_MTIME.load(Ordering::Relaxed);
+    if last == mtime && last != -1 {
         return None;
     }
 
@@ -397,9 +393,12 @@ pub fn load_config(
     let mut dyn_rules: Vec<DynRule> = Vec::new();
     for parsed in parsed {
         match parsed {
-            ParsedRule::Static { pkg, thread, cpus } => {
-                add_rule(&mut rules, topo, &pkg, &thread, &cpus);
-            }
+            ParsedRule::Static { pkg, thread, set, .. } => rules.push(AffinityRule {
+                pkg,
+                thread_pattern: CString::new(thread.as_str()).unwrap_or_default(),
+                cpus: set,
+                thread,
+            }),
             ParsedRule::Dyn { pkg, thread, spec } => dyn_rules.push(DynRule {
                 thread_pattern: CString::new(thread.as_str()).unwrap_or_default(),
                 pkg,
@@ -409,7 +408,7 @@ pub fn load_config(
         }
     }
 
-    *last_mtime = mtime;
+    LAST_MTIME.store(mtime, Ordering::Relaxed);
     PARSE_FAILS.store(fail_cnt, Ordering::Relaxed);
 
     let mut pkgs: HashSet<String> = rules.iter().map(|r| r.pkg.clone()).collect();
@@ -420,6 +419,18 @@ pub fn load_config(
         .map(|r| r.pkg.clone())
         .collect();
     let has_dyn_rules: HashSet<String> = dyn_rules.iter().map(|r| r.pkg.clone()).collect();
+    let mut comm_prefixes: HashSet<String> = HashSet::new();
+    let mut comm_suffixes: HashSet<String> = HashSet::new();
+    for pkg in &pkgs {
+        if pkg.len() > 15 {
+            if let Some(pre) = pkg.get(..15) {
+                comm_prefixes.insert(pre.to_string());
+            }
+            if let Some(suf) = pkg.get(pkg.len() - 15..) {
+                comm_suffixes.insert(suf.to_string());
+            }
+        }
+    }
     let mut rules_by_pkg: HashMap<String, Vec<usize>> = HashMap::new();
     let mut exact_thread_rules: HashMap<String, HashMap<String, Vec<usize>>> = HashMap::new();
     for (i, r) in rules.iter().enumerate() {
@@ -454,7 +465,9 @@ pub fn load_config(
         dyn_rules,
         dyn_by_pkg,
         has_dyn_rules,
-        cpuset_dirs: Mutex::new(HashSet::new()),
+        cpuset_dirs: Mutex::new(HashMap::new()),
+        comm_prefixes,
+        comm_suffixes,
     })
 }
 
@@ -464,22 +477,20 @@ pub fn config_loader() {
         libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
     }
 
-    let mut last_mtime: i64 = -1;
-
     loop {
         let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
         if FORCE_RELOAD.swap(false, Ordering::AcqRel) {
-            last_mtime = -1;
+            LAST_MTIME.store(-1, Ordering::Relaxed);
             if INOTIFY_SUPPORTED.load(Ordering::Acquire) {
                 let fd = INOTIFY_FD.load(Ordering::Acquire);
                 inotify_rewatch(fd);
             }
-            config_reload(&mut last_mtime);
+            config_reload();
         }
         if INOTIFY_SUPPORTED.load(Ordering::Acquire) {
-            inotify_handle(interval, &mut last_mtime);
+            inotify_handle(interval);
         } else {
-            config_reload(&mut last_mtime);
+            config_reload();
             thread::sleep(Duration::from_secs(interval));
         }
     }
@@ -528,12 +539,12 @@ fn disable_inotify(inotify_fd: i32) {
     INOTIFY_WD.store(-1, Ordering::Release);
 }
 
-fn config_reload(last_mtime: &mut i64) {
+fn config_reload() {
     let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
         return;
     };
     let file = lock_ignore_poison(&CONFIG_FILE).clone();
-    let Some(new_cfg) = load_config(&file, &cfg.topo, last_mtime) else {
+    let Some(new_cfg) = load_config(&file, &cfg.topo) else {
         return;
     };
     {
@@ -544,11 +555,10 @@ fn config_reload(last_mtime: &mut i64) {
 }
 
 pub fn config_reload_now() {
-    let mut mtime: i64 = -1;
-    config_reload(&mut mtime);
+    config_reload();
 }
 
-fn inotify_handle(interval: u64, last_mtime: &mut i64) {
+fn inotify_handle(interval: u64) {
     let inotify_fd = INOTIFY_FD.load(Ordering::Acquire);
 
     let mut pfd = libc::pollfd {
@@ -605,7 +615,6 @@ fn inotify_handle(interval: u64, last_mtime: &mut i64) {
             if event.mask & (libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0
             {
                 reload_needed = true;
-                *last_mtime = -1;
                 if event.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
                     needs_rewatch = true;
                 }
@@ -622,7 +631,7 @@ fn inotify_handle(interval: u64, last_mtime: &mut i64) {
     }
 
     if reload_needed {
-        config_reload(last_mtime);
+        config_reload();
     }
 }
 
@@ -664,6 +673,7 @@ mod tests {
             pkg: pkg.to_string(),
             thread: thread.to_string(),
             cpus: cpus.to_string(),
+            set: parse_cpu_spec(cpus, &test_topo()),
         }
     }
 

@@ -25,16 +25,16 @@ check_required_files() {
 extract_bin() {
 	ui_print "********************************************"
 	if [ "$ARCH" == "arm64" ]; then
-		cp $MODPATH/bin/arm64-v8a/AppOpt* $MODPATH
+		cp "$MODPATH/bin/arm64-v8a"/* "$MODPATH"
 	elif [ "$ARCH" == "x64" ]; then
-		cp $MODPATH/bin/x86_64/AppOpt* $MODPATH
+		cp "$MODPATH/bin/x86_64"/* "$MODPATH"
 	else
 		abort "! Unsupported platform: $ARCH"
 	fi
 	ui_print "- Device platform: $ARCH"
-	rm -rf $MODPATH/bin
-	[ -f $MODPATH/AppOpt ] && chmod a+x $MODPATH/AppOpt
-	if ! $MODPATH/AppOpt -v; then
+	rm -rf "$MODPATH/bin"
+	[ -f "$MODPATH/AppOpt" ] && chmod a+x "$MODPATH/AppOpt"
+	if ! "$MODPATH/AppOpt" -v; then
 		abort "! 主程序验证失败，请检查模块zip文件是否损坏"
 	fi
 }
@@ -133,12 +133,15 @@ module_instructions() {
 	cores=$(for cpus in /sys/devices/system/cpu/cpufreq/*/related_cpus; do 
 		[ -f "$cpus" ] && cat "$cpus" | wc -w
 	done | paste -sd+)
+	E_FMT="$(format_cpu_ranges "$e_core")"
+	P_FMT="$(format_cpu_ranges "$p_core")"
+	H_FMT="$(format_cpu_ranges "$hp_core")"
 	ui_print "当前$(getprop ro.soc.model)设备为$(nproc)核CPU，规格是：$cores"
 	ui_print "可用CPU范围：$all_core"
 	ui_print "------------------------------------------"
-	[ -n "$(format_cpu_ranges "$e_core")" ] && echo "$(format_cpu_ranges "$e_core") 为能效小核，频率最高$((e_core_freq/1000)) MHz"
-	[ $total_groups -ge 3 ] && [ -n "$(format_cpu_ranges "$p_core")" ] && echo "$(format_cpu_ranges "$p_core") 为性能中核，频率最高$((p_core_freq/1000)) MHz"
-	[ $total_groups -ge 2 ] && [ -n "$(format_cpu_ranges "$hp_core")" ] && echo "$(format_cpu_ranges "$hp_core") 为高性能大核，频率最高$((hp_core_freq/1000)) MHz"
+	[ -n "$E_FMT" ] && echo "$E_FMT 为能效小核，频率最高$((e_core_freq/1000)) MHz"
+	[ $total_groups -ge 3 ] && [ -n "$P_FMT" ] && echo "$P_FMT 为性能中核，频率最高$((p_core_freq/1000)) MHz"
+	[ $total_groups -ge 2 ] && [ -n "$H_FMT" ] && echo "$H_FMT 为高性能大核，频率最高$((hp_core_freq/1000)) MHz"
 	ui_print "------------------------------------------"
 	ui_print "applist.conf 规则写法示例："
 	ui_print "------------------------------------------"
@@ -147,24 +150,22 @@ module_instructions() {
 		ui_print "surfaceflinger=$all_core"
 		ui_print "------------------------------------------"
 	fi
-	if [ -n "$(format_cpu_ranges "$hp_core")" ]; then
+	if [ -n "$H_FMT" ]; then
 		ui_print "单独将'图形显示组件'渲染引擎线程绑定到大核："
-		ui_print "surfaceflinger{RenderEngine}=$(format_cpu_ranges "$hp_core")"
+		ui_print "surfaceflinger{RenderEngine}=$H_FMT"
 		ui_print "------------------------------------------"
 	fi
-	if [ -n "$(format_cpu_ranges "$e_core")" ]; then
+	if [ -n "$E_FMT" ]; then
 		ui_print "将 '微信' 主进程绑定能效小核："
-		ui_print "com.tencent.mm=$(format_cpu_ranges "$e_core")"
+		ui_print "com.tencent.mm=$E_FMT"
 		ui_print "------------------------------------------"
-	fi
-	if [ -n "$(format_cpu_ranges "$e_core")" ]; then
 		ui_print "将 '微信' 消息推送子进程绑定能效小核："
-		ui_print "com.tencent.mm:push=$(format_cpu_ranges "$e_core")"
+		ui_print "com.tencent.mm:push=$E_FMT"
 		ui_print "------------------------------------------"
 	fi
-	if [ -n "$(format_cpu_ranges "$hp_core")" ]; then
+	if [ -n "$H_FMT" ]; then
 		ui_print "将 '系统界面' 渲染线程绑定到性能大核："
-		ui_print "com.android.systemui{RenderThread}=$(format_cpu_ranges "$hp_core")"
+		ui_print "com.android.systemui{RenderThread}=$H_FMT"
 		ui_print "------------------------------------------"
 	fi
 	ui_print "更多规则使用说明请参考："
@@ -176,11 +177,11 @@ module_instructions() {
 }
 copy_default_rules() {
 if [ -f /data/adb/modules/AppOpt/applist.conf ]; then
-	mv $MODPATH/applist.conf $MODPATH/applist.conf.bak
-	cp -r /data/adb/modules/AppOpt/applist.conf $MODPATH
+	mv "$MODPATH/applist.conf" "$MODPATH/applist.conf.bak"
+	cp -r /data/adb/modules/AppOpt/applist.conf "$MODPATH"
 fi
 if [ -f /data/adb/modules/AppOpt/AppOpt.json ]; then
-	cp -r /data/adb/modules/AppOpt/AppOpt.json $MODPATH
+	cp -r /data/adb/modules/AppOpt/AppOpt.json "$MODPATH"
 fi
 }
 check_magisk_version

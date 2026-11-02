@@ -11,7 +11,6 @@ use crate::config::{AppConfig, DynSpec};
 use crate::rule_match::{cpuset_dir_cached, fnmatch_c, AffinityResult};
 const MIN_HOLD: Duration = Duration::from_secs(2);
 const LOAD_BAND_PCT: u32 = 5;
-// 7 点：高于 EMA 平滑后的噪声带（≈5），低于明显领先（≈10），换手收益能覆盖迁移代价
 const ELECT_SWITCH_PCT: u32 = 7;
 pub struct DynTidState {
     pub tier: u8,
@@ -26,7 +25,6 @@ impl DynTidState {
     fn new() -> Self {
         Self {
             tier: 1,
-            // 初始状态从未切换过，不占防抖窗口，让首次负载/档位响应即时生效
             switch_at: Instant::now() - MIN_HOLD,
             jiffies: 0,
             sampled_at: Instant::now(),
@@ -71,27 +69,19 @@ pub fn elect_decide(
         return None;
     }
     if cur_winner.is_some() && !winner_held {
-        // 防抖窗口内保持现有 winner，避免负载相近时频繁换手
         return None;
     }
     let Some(cur) = cur_winner else {
-        return top_loader(loads);
+        return top_loader(loads).map(|(id, _)| id);
     };
-    let Some(&cur_load) = loads.iter().find(|(id, _)| *id == cur).map(|(_, l)| l) else {
-        // winner 已不在成员中（改名/退出），直接重选
-        return top_loader(loads);
+    let Some(cur_load) = loads.iter().find(|(id, _)| *id == cur).map(|(_, l)| *l) else {
+        return top_loader(loads).map(|(id, _)| id);
     };
-    let best = top_loader(loads)?;
+    let (best, best_load) = top_loader(loads)?;
     if best == cur {
         return None;
     }
-    let best_load = loads
-        .iter()
-        .find(|(id, _)| *id == best)
-        .map(|(_, l)| *l)
-        .unwrap_or(0);
     let beats = if cur_load >= 100 - switch_pct {
-        // 满载附近 5 点差无法表达，退化为纯大小比较，避免永远不换手
         best_load > cur_load
     } else {
         best_load > cur_load + switch_pct
@@ -102,11 +92,11 @@ pub fn elect_decide(
         None
     }
 }
-fn top_loader(loads: &[(i32, u32)]) -> Option<i32> {
+fn top_loader(loads: &[(i32, u32)]) -> Option<(i32, u32)> {
     loads
         .iter()
         .max_by_key(|(id, l)| (*l, std::cmp::Reverse(*id)))
-        .map(|(id, _)| *id)
+        .map(|(id, l)| (*id, *l))
 }
 pub fn load_decide(
     cur_tier: u8,
@@ -211,25 +201,34 @@ pub fn dyn_eval(cfg: &AppConfig, cache: &mut ProcCache) -> usize {
     }
     cache.dyn_state.tids.retain(|tid, _| cache.tasks.contains_key(tid));
     cache.dyn_state.winners.retain(|_, tid| cache.tasks.contains_key(tid));
+    for set in cache.dyn_members.values_mut() {
+        set.retain(|tid| cache.tasks.contains_key(tid));
+    }
+    cache.dyn_members.retain(|_, set| !set.is_empty());
 
     let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
     let mut changed = 0;
+    let now = Instant::now();
 
     for (pkg, idxs) in &cfg.dyn_by_pkg {
         for &gi in idxs {
             let rule = &cfg.dyn_rules[gi];
+            let Some(candidates) = cache.dyn_members.get(&gi) else {
+                continue;
+            };
             let mut members: Vec<(i32, u32)> = Vec::new();
             let mut any_load = false;
-            for (tid, e) in cache.tasks.iter() {
+            for &tid in candidates {
+                let Some(e) = cache.tasks.get(&tid) else {
+                    continue;
+                };
                 if e.pkg != *pkg || !fnmatch_c(&rule.thread_pattern, &e.comm) {
                     continue;
                 }
-                let now = Instant::now();
-                let st = cache.dyn_state.tids.entry(*tid).or_insert_with(DynTidState::new);
-                if let Some(j) = thread_cpu_jiffies(e.pid, *tid) {
+                let st = cache.dyn_state.tids.entry(tid).or_insert_with(DynTidState::new);
+                if let Some(j) = thread_cpu_jiffies(e.pid, tid) {
                     let elapsed = now.duration_since(st.sampled_at);
                     if elapsed >= Duration::from_secs(1) {
-                        // 首轮 jiffies 可能为 0，但 delta 与 elapsed 同为完整运行期，平均负载仍正确
                         let instant = load_pct_from(j - st.jiffies, elapsed.as_secs(), clk_tck);
                         if st.sampled {
                             st.load = ema_load(st.load, instant);
@@ -244,7 +243,7 @@ pub fn dyn_eval(cfg: &AppConfig, cache: &mut ProcCache) -> usize {
                     st.jiffies = j;
                     st.sampled_at = now;
                 }
-                members.push((*tid, st.load));
+                members.push((tid, st.load));
             }
 
             match &rule.spec {
@@ -331,7 +330,6 @@ mod tests {
 
     #[test]
     fn elect_switches_when_surpass_pct() {
-        // 组内负载最高者上高档，challenger 需高过 winner 至少 7 点才换手
         let loads = [(1, 79), (2, 94)];
         assert_eq!(elect_decide(Some(1), &loads, true, ELECT_SWITCH_PCT), Some(2));
         let loads = [(1, 79), (2, 85)];
@@ -340,7 +338,6 @@ mod tests {
         assert_eq!(elect_decide(Some(1), &loads, true, ELECT_SWITCH_PCT), None);
         let loads = [(1, 79), (2, 87)];
         assert_eq!(elect_decide(Some(1), &loads, true, ELECT_SWITCH_PCT), Some(2));
-        // 满载附近退化：winner 97 时 challenger 100 只高 3 点也应换
         let loads = [(1, 97), (2, 100)];
         assert_eq!(elect_decide(Some(1), &loads, true, ELECT_SWITCH_PCT), Some(2));
         let loads = [(1, 90), (2, 93)];
@@ -423,7 +420,9 @@ mod tests {
             dyn_rules,
             dyn_by_pkg,
             has_dyn_rules,
-            cpuset_dirs: Mutex::new(HashSet::new()),
+            cpuset_dirs: Mutex::new(HashMap::new()),
+            comm_prefixes: HashSet::new(),
+            comm_suffixes: HashSet::new(),
         }
     }
 
@@ -463,7 +462,9 @@ mod tests {
             dyn_rules,
             dyn_by_pkg,
             has_dyn_rules,
-            cpuset_dirs: Mutex::new(HashSet::new()),
+            cpuset_dirs: Mutex::new(HashMap::new()),
+            comm_prefixes: HashSet::new(),
+            comm_suffixes: HashSet::new(),
         }
     }
 
@@ -515,6 +516,8 @@ mod tests {
                     is_thread_rule: true,
                 },
             );
+            cache.dyn_members.entry(0).or_default().insert(tid);
+            cache.tid_group.insert(tid, 0);
         }
 
         dyn_eval(&cfg, &mut cache);
@@ -576,6 +579,8 @@ mod tests {
                     is_thread_rule: true,
                 },
             );
+            cache.dyn_members.entry(0).or_default().insert(tid);
+            cache.tid_group.insert(tid, 0);
         }
 
         dyn_eval(&cfg, &mut cache);

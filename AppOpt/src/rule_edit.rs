@@ -384,6 +384,11 @@ pub fn rule_delete_pkg(path: &str, pkg: &str) -> RuleEdit {
         .collect();
     normalize_singles(&mut lines, pkg);
 
+    let t0 = target_scan(&lines, pkg);
+    if t0.block_open.is_some() && t0.block_close.is_none() {
+        return RuleEdit::Malformed;
+    }
+
     let mut removed = false;
     loop {
         let t = target_scan(&lines, pkg);

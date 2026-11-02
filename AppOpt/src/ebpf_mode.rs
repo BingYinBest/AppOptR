@@ -438,6 +438,19 @@ fn applied_clear(bpf: &mut Ebpf) {
         let _ = m.remove(k);
     }
 }
+pub fn dropped_take(bpf: &mut Ebpf) -> u32 {
+    let Some(map) = bpf.map_mut("DROPPED_COUNT") else {
+        return 0;
+    };
+    let Ok(mut m) = AyaHashMap::<_, u32, u32>::try_from(map) else {
+        return 0;
+    };
+    let v = m.get(&0, 0).ok().unwrap_or(0);
+    if v > 0 {
+        let _ = m.insert(0, 0, 0);
+    }
+    v
+}
 fn affinity_apply(
     tid: i32,
     cpus: &CpuSet,
