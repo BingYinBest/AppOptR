@@ -347,9 +347,8 @@ fn main() {
         ebpf_state,
         affinity_deadline: Instant::now(),
         web_stats_deadline: Instant::now(),
-        ebpf_retry_at: Instant::now()
-            .checked_sub(Duration::from_secs(60))
-            .unwrap_or_else(Instant::now),
+        // 立即满足首次 eBPF 重试条件
+        ebpf_retry_at: Instant::now() - Duration::from_secs(60),
         dyn_deadline: Instant::now(),
         ebpf_reconcile_deadline: Instant::now(),
         prog_start: Instant::now(),

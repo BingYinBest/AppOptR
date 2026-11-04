@@ -33,6 +33,10 @@ pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
 pub static WEB_STATS: Mutex<Option<WebStats>> = Mutex::new(None);
 const MAX_CONNS: usize = 64;
 static CONN_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+const MAX_HEAD_BYTES: usize = 8192;
+const MAX_BODY_BYTES: usize = 16384;
+const MAX_SUGGEST_QUERY: usize = 64;
+const SUGGEST_CACHE_MAX: usize = 16;
 const SUGGEST_TTL: Duration = Duration::from_secs(3);
 static SUGGEST_PKG_CACHE: Mutex<Option<(Instant, BTreeMap<String, usize>)>> = Mutex::new(None);
 type ThreadSuggestCache = BTreeMap<String, (Instant, BTreeMap<String, usize>)>;
@@ -117,7 +121,7 @@ fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
             break;
         }
         head.extend_from_slice(&line);
-        if head.len() > 8192 {
+        if head.len() > MAX_HEAD_BYTES {
             return None;
         }
     }
@@ -146,7 +150,7 @@ fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
             _ => {}
         }
     }
-    if len > 16384 {
+    if len > MAX_BODY_BYTES {
         return None;
     }
 
@@ -351,6 +355,7 @@ fn rules_json() -> String {
     }
     json!({ "rules": groups }).to_string()
 }
+// 包名/线程名写入配置文件后按 rfind('=') 与 {} 切分，含这些字符会破坏解析，一律拒绝
 fn token_ok(s: &str, max: usize) -> bool {
     let t = s.trim();
     !t.is_empty()
@@ -358,10 +363,7 @@ fn token_ok(s: &str, max: usize) -> bool {
         && !t.bytes().any(|b| b < 0x20 || b == 0x7f)
         && !t.contains('#')
         && !t.contains("//")
-}
-
-fn pkg_shape_ok(pkg: &str) -> bool {
-    !(pkg.contains('{') && pkg.ends_with('}'))
+        && !t.contains(['=', '{', '}'])
 }
 
 fn rule_api(req: &Request) -> (u16, String) {
@@ -380,9 +382,6 @@ fn rule_api(req: &Request) -> (u16, String) {
     };
     if !token_ok(pkg, MAX_PKG_LEN) || (!thread.is_empty() && !token_ok(thread, MAX_THREAD_LEN)) {
         return err_json(400, "名称含有非法字符");
-    }
-    if thread.is_empty() && !pkg_shape_ok(pkg) {
-        return err_json(400, "包名含 { 且以 } 结尾时不支持包级规则，可改用线程规则");
     }
     let spec_ok = (spec_like(cpus) && parse_cpu_spec(cpus, &cfg.topo).count() != 0)
         || dyn_spec_try(cpus, &cfg.topo).is_some();
@@ -440,9 +439,6 @@ fn rule_rename_api(req: &Request) -> (u16, String) {
     if !token_ok(old, MAX_PKG_LEN) || !token_ok(new, MAX_PKG_LEN) {
         return err_json(400, "名称含有非法字符");
     }
-    if !pkg_shape_ok(new) {
-        return err_json(400, "包名含 { 且以 } 结尾时不可作为重命名目标");
-    }
     if old == new {
         return (200, json!({ "ok": true }).to_string());
     }
@@ -464,7 +460,7 @@ fn suggest_api(req: &Request) -> (u16, String) {
         return err_json(400, "请求体不是合法 JSON");
     };
     let q = v["q"].as_str().map(str::trim).unwrap_or("");
-    if q.len() > 64 {
+    if q.len() > MAX_SUGGEST_QUERY {
         return err_json(400, "q 过长");
     }
     let list: Vec<String> = match v["pkg"].as_str().map(str::trim).filter(|p| !p.is_empty()) {
@@ -551,8 +547,17 @@ fn suggest_threads(pkg: &str, q: &str) -> Vec<(String, usize)> {
                 }
             });
             guard.insert(pkg.to_string(), (Instant::now(), m.clone()));
-            if guard.len() > 16 {
-                guard.retain(|_, (t, _)| t.elapsed() < SUGGEST_TTL);
+            // 先清过期，仍超上限则淘汰最旧的，保证缓存有界
+            guard.retain(|_, (t, _)| t.elapsed() < SUGGEST_TTL);
+            while guard.len() > SUGGEST_CACHE_MAX {
+                let Some(oldest) = guard
+                    .iter()
+                    .max_by_key(|(_, (t, _))| *t)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                guard.remove(&oldest);
             }
             m
         }
@@ -619,7 +624,7 @@ fn config_set_api(req: &Request) -> (u16, String) {
         }
         if let Some(cfg) = current_cfg()
             && cfg.topo.cpuset_enabled {
-                create_cpuset_dir(&base_cpuset(), &cfg.topo.present_str, &cfg.topo.mems_str);
+                create_cpuset_dir(base_cpuset(), &cfg.topo.present_str, &cfg.topo.mems_str);
             }
         FORCE_RELOAD.store(true, Ordering::Release);
     }

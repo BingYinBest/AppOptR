@@ -8,7 +8,7 @@ use std::thread;
 use aya::maps::{Array as AyaArray, HashMap as AyaHashMap};
 use aya::{programs::TracePoint as AyaTracePoint, Ebpf, EbpfLoader, Pod};
 
-use crate::apply_affinity::{affinity_set, proc_walk, task_tids, tid_comm};
+use crate::apply_affinity::{affinity_set, proc_walk, task_tids, tid_comm, tid_tgid};
 use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
 use crate::cpuset::CpuSet;
@@ -117,6 +117,7 @@ fn comm_keys_build<'a, I: IntoIterator<Item = &'a String>>(pkgs: I) -> Vec<[u8; 
     entries.dedup();
     entries
 }
+// 返回 true 表示白名单装不下（需整体重载 eBPF），false 表示已原地更新
 pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32) -> bool {
     let entries = comm_keys_build(pkgs.iter());
 
@@ -481,8 +482,12 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
                 applied_del(&mut state.bpf, tid);
             }
 
-        EBPF_EVENT_FORK => {
-        }
+        EBPF_EVENT_FORK
+            if tid_tgid(tid) == Some(pid)
+                && !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) => {
+                state.cache.task_del(tid);
+                applied_del(&mut state.bpf, tid);
+            }
 
         EBPF_EVENT_RENAME
             if !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) => {

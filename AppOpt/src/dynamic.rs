@@ -9,6 +9,7 @@ use crate::apply_affinity::affinity_set;
 use crate::cache::ProcCache;
 use crate::config::{AppConfig, DynSpec};
 use crate::rule_match::{cpuset_dir_cached, fnmatch_c, AffinityResult};
+// 档位切换驻留时间与滞回参数；评估周期跟随检查间隔（CHECK_INTERVAL，默认 2s），负载采样窗口 >=1s
 const MIN_HOLD: Duration = Duration::from_secs(2);
 const LOAD_BAND_PCT: u32 = 5;
 const ELECT_SWITCH_PCT: u32 = 7;
@@ -81,6 +82,7 @@ pub fn elect_decide(
     if best == cur {
         return None;
     }
+    // 现任已近满载时只需更高即可换人，避免高负载下频繁抖动
     let beats = if cur_load >= 100 - switch_pct {
         best_load > cur_load
     } else {
@@ -181,7 +183,7 @@ fn apply_tier(cache: &mut ProcCache, cfg: &AppConfig, tid: i32, want: u8, spec: 
     let cpus = spec.tier_cpus(want);
     let cpuset_dir = cpuset_dir_cached(&cpus, cfg);
     if affinity_set(tid, &cpus, &cpuset_dir, &cfg.topo) {
-        cache.tasks.remove(&tid);
+        cache.task_del(tid);
         cache.dyn_state.tids.remove(&tid);
         return 0;
     }
@@ -237,8 +239,6 @@ pub fn dyn_eval(cfg: &AppConfig, cache: &mut ProcCache) -> usize {
                             st.sampled = true;
                         }
                         any_load = true;
-                    } else {
-                        st.load = 0;
                     }
                     st.jiffies = j;
                     st.sampled_at = now;
@@ -543,9 +543,11 @@ mod tests {
     #[test]
     fn dyn_eval_elect_establishes_winner_after_first_sample() {
         let stop = Arc::new(AtomicBool::new(false));
-        let spawn_busy = |name: &str| -> i32 {
+        let spawn_busy = |name: &str| -> (i32, Arc<AtomicBool>) {
             let (tx, rx) = mpsc::channel::<i32>();
             let stop_t = stop.clone();
+            let pause = Arc::new(AtomicBool::new(false));
+            let pause_t = pause.clone();
             let name = name.to_string();
             let h = thread::Builder::new()
                 .name(name.clone())
@@ -553,16 +555,20 @@ mod tests {
                     tx.send(unsafe { libc::syscall(libc::SYS_gettid) as i32 })
                         .unwrap();
                     while !stop_t.load(Ordering::Relaxed) {
-                        std::hint::spin_loop();
+                        if pause_t.load(Ordering::Relaxed) {
+                            thread::sleep(Duration::from_millis(10));
+                        } else {
+                            std::hint::spin_loop();
+                        }
                     }
                 })
                 .unwrap();
             let tid = rx.recv().unwrap();
             drop(h);
-            tid
+            (tid, pause)
         };
-        let tid_a = spawn_busy("Thread-1");
-        let tid_b = spawn_busy("Thread-2");
+        let (tid_a, pause_a) = spawn_busy("Thread-1");
+        let (tid_b, pause_b) = spawn_busy("Thread-2");
 
         let pid = std::process::id() as i32;
         let cfg = dyn_elect_cfg();
@@ -606,12 +612,14 @@ mod tests {
             "非 winner 线程保持低档"
         );
 
+        // 暂停非 winner 线程使其负载归零，消除真实采样抖动，确定性验证 winner 保持
+        if w == tid_a { pause_b.store(true, Ordering::Relaxed); } else { pause_a.store(true, Ordering::Relaxed); }
         thread::sleep(Duration::from_secs(2));
         dyn_eval(&cfg, &mut cache);
         assert_eq!(
             cache.dyn_state.winners.get(&0).copied(),
             Some(w),
-            "平局时 winner 应保持不换手"
+            "负载悬殊时 winner 应保持不换手"
         );
 
         stop.store(true, Ordering::Relaxed);

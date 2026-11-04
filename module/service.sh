@@ -7,7 +7,7 @@ wait_sys_boot_completed() {
 }
 wait_sys_boot_completed
 MODDIR=${0%/*}
-cd $MODDIR
+cd "$MODDIR"
 
 nohup "$MODDIR/AppOpt" -w >/dev/null 2>&1 &
 

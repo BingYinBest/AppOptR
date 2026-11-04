@@ -58,7 +58,7 @@ pub struct DynRule {
 }
 #[derive(Debug, PartialEq)]
 pub enum ParsedRule {
-    Static { pkg: String, thread: String, cpus: String, set: CpuSet },
+    Static { pkg: String, thread: String, set: CpuSet },
     Dyn { pkg: String, thread: String, spec: DynSpec },
 }
 
@@ -258,7 +258,6 @@ fn parse_rule_entry(
     Some(ParsedRule::Static {
         pkg: pkg.to_string(),
         thread: thread.to_string(),
-        cpus: cpus.to_string(),
         set,
     })
 }
@@ -672,7 +671,6 @@ mod tests {
         ParsedRule::Static {
             pkg: pkg.to_string(),
             thread: thread.to_string(),
-            cpus: cpus.to_string(),
             set: parse_cpu_spec(cpus, &test_topo()),
         }
     }

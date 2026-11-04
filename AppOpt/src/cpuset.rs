@@ -8,22 +8,20 @@ use std::sync::RwLock;
 pub const CPU_SETSIZE: usize = 1024;
 pub const CPU_WORD_BITS: usize = 64;
 pub const CPU_WORDS: usize = CPU_SETSIZE / CPU_WORD_BITS;
-static BASE_CPUSET_PATH: RwLock<Option<String>> = RwLock::new(None);
+static BASE_CPUSET_PATH: RwLock<&'static str> =
+    RwLock::new("/dev/cpuset/AppOpt");
 
 pub const DEFAULT_CPUSET_NAME: &str = "AppOpt";
 pub fn set_base_cpuset(name: &str) {
     if name.is_empty() || name.contains('/') {
         return;
     }
-    *BASE_CPUSET_PATH.write().unwrap() = Some(format!("/dev/cpuset/{}", name));
+    let leaked: &'static str = Box::leak(format!("/dev/cpuset/{}", name).into_boxed_str());
+    *BASE_CPUSET_PATH.write().unwrap() = leaked;
 }
 
-pub fn base_cpuset() -> String {
-    BASE_CPUSET_PATH
-        .read()
-        .unwrap()
-        .clone()
-        .unwrap_or_else(|| format!("/dev/cpuset/{DEFAULT_CPUSET_NAME}"))
+pub fn base_cpuset() -> &'static str {
+    *BASE_CPUSET_PATH.read().unwrap()
 }
 
 const _: () = assert!(std::mem::size_of::<CpuSet>() == std::mem::size_of::<libc::cpu_set_t>());
@@ -382,7 +380,7 @@ pub fn init_cpu_topo() -> CpuTopology {
         .unwrap_or_else(|| "0".to_string());
     topo.mems_str = mems;
 
-    if create_cpuset_dir(&base_cpuset(), &topo.present_str, &topo.mems_str) {
+    if create_cpuset_dir(base_cpuset(), &topo.present_str, &topo.mems_str) {
         topo.cpuset_enabled = true;
     }
 

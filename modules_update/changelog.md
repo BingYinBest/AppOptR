@@ -1,3 +1,14 @@
+### v2.5.0更新日志
+- 修复：eBPF 模式下新建线程（pthread_create 只触发 fork 事件）从未应用规则，导致游戏（如王者荣耀）的线程级绑定无效；现 fork 事件按所属进程（Tgid 校验）正常分发，子进程 fork 不误判
+- 修复：动态规则 load 采样间隔 <1s 时负载被清零，EMA 被稀释导致 load 规则判定漂移
+- 修复：动态规则切档时线程死亡仅删 tasks，残留 by_pid/tid_group 索引；改为统一 task_del 清理
+- 修复：web 建议缓存只清过期项，全新鲜时可无限增长；改为超上限淘汰最旧项
+- 修复：web 接口包名/线程名未拒绝 = { } 字符，写入配置会被 rfind('=') 与块语法解析错乱
+- 修复：sched_setaffinity 非 ESRCH 失败时静默，现增加告警日志
+- 性能：base_cpuset 改为 &'static str 零分配返回，消除每次亲和性设置的堆分配；proc 线程集合比较免构造旧集合
+- 清理：删除 ParsedRule::Static 未使用的 cpus 字段、eBPF 侧 EventMeta.parent_tgid 死字段、build.sh 过期 README 提示；web 层魔数提取为命名常量
+- 稳定：动态规则 elect 测试依赖真实负载采样偶发 flaky，改为暂停非 winner 线程确定化验证（AppOpt-ebpf 同步 0.3.4）
+
 ### v2.4.0更新日志
 - 性能：/proc 轮询路径重构——已跟踪进程包名缓存（每轮免读 cmdline，60s 周期复核）、线程集合变化时只读新增 tid 的 comm、by_pid 反向索引替代全表扫描
 - 性能：动态规则按组维护成员索引，评估从全表扫描改为按成员迭代

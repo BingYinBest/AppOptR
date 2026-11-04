@@ -65,7 +65,6 @@ struct EventMeta {
     tid: i32,
     comm: [u8; 16],
     parent_tid: u32,
-    parent_tgid: u32,
 }
 
 #[inline(always)]
@@ -111,7 +110,6 @@ fn fork_parse(ctx: &TracePointContext, offsets: &TracepointOffsets) -> EventMeta
         tid: child_pid,
         comm: child_comm,
         parent_tid,
-        parent_tgid,
     }
 }
 
@@ -123,7 +121,6 @@ fn exec_parse() -> EventMeta {
         tid: pid_tgid as i32,
         comm: bpf_get_current_comm().unwrap_or_default(),
         parent_tid: 0,
-        parent_tgid: 0,
     }
 }
 

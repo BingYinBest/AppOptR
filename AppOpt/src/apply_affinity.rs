@@ -41,6 +41,18 @@ pub(crate) fn tid_comm(tid: i32) -> Option<String> {
     Some(name.trim().to_string())
 }
 
+pub(crate) fn tid_tgid(tid: i32) -> Option<i32> {
+    let mut buf = [0u8; 1024];
+    let bytes = read_proc_file(tid, "status", &mut buf)?;
+    let text = std::str::from_utf8(bytes).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("Tgid:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
 pub(crate) fn task_tids(pid: i32) -> Option<Vec<i32>> {
     let mut path_buf = [0u8; 32];
     let mut cur = std::io::Cursor::new(&mut path_buf[..]);
@@ -85,7 +97,10 @@ pub fn affinity_set(
         }
     }
     if let Err(e) = cpus.set_affinity(tid) {
-        return e.raw_os_error() == Some(libc::ESRCH);
+        if e.raw_os_error() == Some(libc::ESRCH) {
+            return true;
+        }
+        eprintln!("警告: 设置 tid={} 亲和性失败 ({})", tid, e);
     }
 
     false

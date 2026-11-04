@@ -103,17 +103,16 @@ fn proc_tasks(pid: i32, pkg: &str, cfg: &AppConfig, cache: &mut ProcCache) -> bo
         cfg.has_thread_rules.contains(pkg) || cfg.has_dyn_rules.contains(pkg);
     let Some(tids) = task_tids(pid) else { return false };
     let live: HashSet<i32> = tids.iter().copied().collect();
-    let old: HashSet<i32> = cache
+    let unchanged = cache
         .by_pid
         .get(&pid)
-        .map(|v| v.iter().copied().collect())
-        .unwrap_or_default();
-    if old == live {
+        .is_some_and(|o| o.len() == live.len() && o.iter().all(|t| live.contains(t)));
+    if unchanged {
         return false;
     }
     for tid in &tids {
         let thread_name = if has_thread_rules {
-            if old.contains(tid) {
+            if cache.tasks.contains_key(tid) {
                 cache
                     .tasks
                     .get(tid)
