@@ -1,9 +1,9 @@
 use std::ffi::CString;
 
-use crate::{lock_ignore_poison, MAX_THREAD_LEN};
 use crate::apply_affinity::read_cmdline;
-use crate::config::{pattern_has_meta, AppConfig};
+use crate::config::AppConfig;
 use crate::cpuset::{base_cpuset, create_cpuset_dir, CpuSet};
+use crate::{lock_ignore_poison, MAX_THREAD_LEN};
 pub struct AffinityResult {
     pub cpus: CpuSet,
     pub cpuset_dir: String,
@@ -48,7 +48,7 @@ pub fn thread_affinity(
         }
         for &i in pkg_rules {
             let rule = &cfg.rules[i];
-            if rule.thread.is_empty() || !pattern_has_meta(&rule.thread) {
+            if !rule.is_pattern {
                 continue;
             }
             if fnmatch_c(&rule.thread_pattern, thread) {
@@ -118,7 +118,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
 
-    use crate::config::AffinityRule;
+    use crate::config::{pattern_has_meta, AffinityRule};
     use crate::cpuset::CpuTopology;
 
     fn cpus_of(cpus: &[usize]) -> CpuSet {
@@ -147,6 +147,7 @@ mod tests {
             pkg: pkg.to_string(),
             thread: String::new(),
             thread_pattern: CString::new("").unwrap(),
+            is_pattern: false,
             cpus: cpus_of(cpus),
         }
     }
@@ -156,6 +157,7 @@ mod tests {
             pkg: pkg.to_string(),
             thread: thread.to_string(),
             thread_pattern: CString::new(thread).unwrap(),
+            is_pattern: pattern_has_meta(thread),
             cpus: cpus_of(cpus),
         }
     }

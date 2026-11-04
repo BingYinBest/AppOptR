@@ -1,11 +1,11 @@
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, File};
 use std::io::Write as _;
 use std::os::unix::fs::FileExt;
 
-use crate::{MAX_PKG_LEN, MAX_THREAD_LEN};
 use crate::config::AppConfig;
-use crate::cpuset::{base_cpuset, CpuSet, CpuTopology};
+use crate::cpuset::{tasks_file, tasks_path, CpuSet, CpuTopology};
+use crate::{MAX_PKG_LEN, MAX_THREAD_LEN};
 fn read_proc_file<'a>(pid: i32, suffix: &str, buf: &'a mut [u8]) -> Option<&'a [u8]> {
     let mut path = [0u8; 32];
     let mut cur = std::io::Cursor::new(&mut path[..]);
@@ -67,6 +67,20 @@ pub(crate) fn task_tids(pid: i32) -> Option<Vec<i32>> {
             .collect(),
     )
 }
+/// 将线程写入 cpuset tasks 文件（单次 write，O_APPEND 下写入原子）
+fn cpuset_attach(tid: i32, cpuset_dir: &str) {
+    let path = tasks_path(cpuset_dir);
+    let Some(file) = tasks_file(&path) else {
+        eprintln!("警告: 打开 cpuset tasks 文件 {} 失败", path);
+        return;
+    };
+    let line = format!("{}\n", tid);
+    let mut sink: &File = file.as_ref();
+    if let Err(e) = sink.write_all(line.as_bytes()) {
+        eprintln!("警告: cpuset 迁移 tid={} 到 {} 失败 ({})", tid, path, e);
+    }
+}
+
 pub fn affinity_set(
     tid: i32,
     cpus: &CpuSet,
@@ -78,23 +92,7 @@ pub fn affinity_set(
             return false;
         }
     if topo.cpuset_enabled {
-        let base = base_cpuset();
-        let mut path = [0u8; 256];
-        let mut cur = std::io::Cursor::new(&mut path[..]);
-        if cpuset_dir.is_empty() {
-            let _ = write!(cur, "{}/tasks", base);
-        } else {
-            let _ = write!(cur, "{}/{}/tasks", base, cpuset_dir);
-        }
-        let len = cur.position() as usize;
-        let path_str = std::str::from_utf8(&path[..len]).unwrap_or_default();
-        if let Err(e) = fs::OpenOptions::new()
-            .append(true)
-            .open(path_str)
-            .and_then(|mut f| writeln!(f, "{}", tid))
-        {
-            eprintln!("警告: cpuset 迁移 tid={} 到 {} 失败 ({})", tid, path_str, e);
-        }
+        cpuset_attach(tid, cpuset_dir);
     }
     if let Err(e) = cpus.set_affinity(tid) {
         if e.raw_os_error() == Some(libc::ESRCH) {
@@ -120,26 +118,20 @@ pub fn affinity_sync_batch<'a>(
         for (tid, _, dir) in &to_move {
             groups.entry(dir).or_default().push(*tid);
         }
-        let base = base_cpuset();
         for (dir, tids) in &groups {
-            let mut path = [0u8; 256];
-            let mut cur = std::io::Cursor::new(&mut path[..]);
-            if dir.is_empty() {
-                let _ = write!(cur, "{}/tasks", base);
-            } else {
-                let _ = write!(cur, "{}/{}/tasks", base, dir);
-            }
-            let len = cur.position() as usize;
-            let Some(path_str) = std::str::from_utf8(&path[..len]).ok() else {
+            let path = tasks_path(dir);
+            let Some(file) = tasks_file(&path) else {
+                eprintln!("警告: 打开 cpuset tasks 文件 {} 失败", path);
                 continue;
             };
-            match fs::OpenOptions::new().append(true).open(path_str) {
-                Ok(mut f) => {
-                    for tid in tids {
-                        let _ = writeln!(f, "{}", tid);
-                    }
-                }
-                Err(e) => eprintln!("警告: cpuset 迁移 {} 失败 ({})", path_str, e),
+            let mut buf = String::with_capacity(tids.len() * 8);
+            for tid in tids {
+                buf.push_str(&tid.to_string());
+                buf.push('\n');
+            }
+            let mut sink: &File = file.as_ref();
+            if let Err(e) = sink.write_all(buf.as_bytes()) {
+                eprintln!("警告: cpuset 迁移 {} 失败 ({})", path, e);
             }
         }
     }

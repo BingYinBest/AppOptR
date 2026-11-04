@@ -27,8 +27,8 @@ use crate::config::{
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::dynamic::dyn_eval;
 use crate::ebpf_mode::{
-    affinity_check, dropped_take, full_scan, event_dispatch, comm_map_init,
-    ebpf_init, EbpfState,
+    affinity_check, comm_map_init, dropped_take, event_dispatch, full_scan, ebpf_init,
+    CommMapUpdate, EbpfState,
 };
 use crate::proc_mode::{proc_diff, ProcScanState};
 use crate::web::{
@@ -58,6 +58,90 @@ fn print_help() {
     println!("  -w                 启用网页前端 (仅本机 127.0.0.1:8889)");
     println!("  -v                 显示程序版本");
     println!("  -h                 显示帮助信息");
+}
+
+/// 命令行参数
+struct CliOptions {
+    config_file: Option<String>,
+    interval: Option<u64>,
+    cpuset_name: Option<String>,
+    web: bool,
+}
+
+/// 读取选项的后置参数，缺省时直接退出
+fn arg_value(args: &[String], index: &mut usize, flag: &str) -> String {
+    *index += 1;
+    match args.get(*index) {
+        Some(value) => value.clone(),
+        None => {
+            eprintln!("错误: {} 需要指定参数值", flag);
+            process::exit(1);
+        }
+    }
+}
+
+fn parse_args(args: &[String]) -> CliOptions {
+    let mut opts = CliOptions {
+        config_file: None,
+        interval: None,
+        cpuset_name: None,
+        web: false,
+    };
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-c" => {
+                let path = arg_value(args, &mut i, "-c");
+                println!("配置文件: {}", path);
+                opts.config_file = Some(path);
+            }
+            "-s" => {
+                let raw = arg_value(args, &mut i, "-s");
+                match raw.parse::<u64>() {
+                    Ok(value) if value >= 1 => {
+                        println!("检查间隔: {} 秒", value);
+                        opts.interval = Some(value);
+                    }
+                    _ => {
+                        eprintln!("无效的时间间隔: {}", raw);
+                        eprintln!("间隔必须是 >=1 的整数");
+                        process::exit(1);
+                    }
+                }
+            }
+            "-w" => opts.web = true,
+            "-b" => {
+                let name = arg_value(args, &mut i, "-b");
+                if name.is_empty() || name.contains('/') {
+                    eprintln!("无效的 cpuset 目录名: {}", name);
+                    eprintln!("目录名不能为空或包含路径分隔符");
+                    process::exit(1);
+                }
+                println!("cpuset 目录名: {}", name);
+                opts.cpuset_name = Some(name);
+            }
+            "-v" => {
+                let ebpf = crate::ebpf_mode::ebpf_probe();
+                println!(
+                    "AppOpt 版本 {}{}",
+                    env!("CARGO_PKG_VERSION"),
+                    if ebpf { " eBPF" } else { "" }
+                );
+                process::exit(0);
+            }
+            "-h" => {
+                print_help();
+                process::exit(0);
+            }
+            other => {
+                eprintln!("未知选项: {}", other);
+                print_help();
+                process::exit(1);
+            }
+        }
+        i += 1;
+    }
+    opts
 }
 struct LoopState {
     config_handle: thread::JoinHandle<()>,
@@ -90,8 +174,9 @@ fn switch_to_proc_if_forced(state: &mut LoopState, mode: u8) {
 }
 fn ebpf_start(state: &mut LoopState, cfg: &AppConfig) -> bool {
     let Some(mut new_es) = ebpf_init() else { return false };
-    if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
-        eprintln!("eBPF: 白名单容量不足，回退到 /proc 轮询");
+    if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) == CommMapUpdate::ReloadRequired
+    {
+        eprintln!("eBPF: 白名单配置失败，回退到 /proc 轮询");
         return false;
     }
     full_scan(cfg, &mut new_es);
@@ -113,18 +198,21 @@ fn try_ebpf_reinit(state: &mut LoopState, cfg: &AppConfig, mode: u8) {
         }
     }
 }
+/// 配置变更后同步内核白名单；需要重载 eBPF 时返回 true
 fn ebpf_reload_requested(state: &mut LoopState, cfg: &AppConfig, config_changed: bool) -> bool {
-    if let Some(es) = state.ebpf_state.as_mut()
-        && config_changed
-    {
-        if comm_map_init(&mut es.bpf, &cfg.pkgs, es.comm_capacity) {
-            true
-        } else {
+    let Some(es) = state.ebpf_state.as_mut() else {
+        return false;
+    };
+    if !config_changed {
+        return false;
+    }
+    match comm_map_init(&mut es.bpf, &cfg.pkgs, es.comm_capacity) {
+        CommMapUpdate::Updated => {
+            // 白名单可能新增了包名，重扫一次让存量进程立即应用规则
             full_scan(cfg, es);
             false
         }
-    } else {
-        false
+        CommMapUpdate::ReloadRequired => true,
     }
 }
 fn rebuild_ebpf(state: &mut LoopState, cfg: &AppConfig) {
@@ -218,82 +306,15 @@ fn update_web_stats(state: &mut LoopState, cfg: &AppConfig) {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let (mut cli_cfg, mut cli_interval, mut cli_cpuset, mut cli_web) =
-        (None, None, None, false);
+    let cli = parse_args(&args);
+    let settings = settings_load(SETTINGS_FILE);
 
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-c" => {
-                i += 1;
-                if i < args.len() {
-                    cli_cfg = Some(args[i].clone());
-                    println!("配置文件: {}", args[i]);
-                } else {
-                    eprintln!("错误: -c 需要指定配置文件路径");
-                    process::exit(1);
-                }
-            }
-            "-s" => {
-                i += 1;
-                if i < args.len() {
-                    let val: u64 = match args[i].parse() {
-                        Ok(v) if v >= 1 => v,
-                        _ => {
-                            eprintln!("无效的时间间隔: {}", args[i]);
-                            eprintln!("间隔必须是 >=1 的整数");
-                            process::exit(1);
-                        }
-                    };
-                    cli_interval = Some(val);
-                    println!("检查间隔: {} 秒", val);
-                } else {
-                    eprintln!("错误: -s 需要指定时间间隔");
-                    process::exit(1);
-                }
-            }
-            "-w" => {
-                cli_web = true;
-            }
-            "-b" => {
-                i += 1;
-                if i < args.len() {
-                    cli_cpuset = Some(args[i].clone());
-                    if args[i].is_empty() || args[i].contains('/') {
-                        eprintln!("无效的 cpuset 目录名: {}", args[i]);
-                        eprintln!("目录名不能为空或包含路径分隔符");
-                        process::exit(1);
-                    }
-                    println!("cpuset 目录名: {}", args[i]);
-                } else {
-                    eprintln!("错误: -b 需要指定 cpuset 目录名");
-                    process::exit(1);
-                }
-            }
-            "-v" => {
-                let ebpf = crate::ebpf_mode::ebpf_probe();
-                println!("AppOpt 版本 {}{}", env!("CARGO_PKG_VERSION"), if ebpf { " eBPF" } else { "" });
-                process::exit(0);
-            }
-            "-h" => {
-                print_help();
-                process::exit(0);
-            }
-            other => {
-                eprintln!("未知选项: {}", other);
-                print_help();
-                process::exit(1);
-            }
-        }
-        i += 1;
-    }
-    let st = settings_load(SETTINGS_FILE);
-    let config_file = cli_cfg.unwrap_or(st.config_file);
-    let sleep_interval = cli_interval.unwrap_or(st.check_interval);
-    let cpuset_name = cli_cpuset.unwrap_or_else(|| st.cpuset_name.clone());
-    let web_enable = cli_web || st.web_enable;
-    if cpuset_name != st.cpuset_name {
-        crate::cpuset::remove_cpuset_dir(&st.cpuset_name);
+    let config_file = cli.config_file.unwrap_or(settings.config_file);
+    let sleep_interval = cli.interval.unwrap_or(settings.check_interval);
+    let cpuset_name = cli.cpuset_name.unwrap_or(settings.cpuset_name.clone());
+    let web_enable = cli.web || settings.web_enable;
+    if cpuset_name != settings.cpuset_name {
+        crate::cpuset::remove_cpuset_dir(&settings.cpuset_name);
     }
     set_base_cpuset(&cpuset_name);
     let topo = init_cpu_topo();
@@ -310,7 +331,7 @@ fn main() {
         *guard = config_file.clone();
     }
     CHECK_INTERVAL.store(sleep_interval, Ordering::Release);
-    MODE_FORCE.store(st.mode, Ordering::Release);
+    MODE_FORCE.store(settings.mode, Ordering::Release);
 
     let initial_config = match load_config(&config_file, &topo) {
         Some(cfg) => cfg,

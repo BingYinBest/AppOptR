@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt::Write as _;
-use std::fs;
+use std::fs::{self, File};
 use std::io;
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
-use std::sync::RwLock;
+use crate::lock_ignore_poison;
 
 pub const CPU_SETSIZE: usize = 1024;
 pub const CPU_WORD_BITS: usize = 64;
@@ -11,17 +13,53 @@ pub const CPU_WORDS: usize = CPU_SETSIZE / CPU_WORD_BITS;
 static BASE_CPUSET_PATH: RwLock<&'static str> =
     RwLock::new("/dev/cpuset/AppOpt");
 
+/// cpuset tasks 文件句柄缓存：亲和性变更频繁，重复 open/close 会成为热点
+static TASKS_FILES: LazyLock<Mutex<HashMap<String, Arc<File>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 pub const DEFAULT_CPUSET_NAME: &str = "AppOpt";
 pub fn set_base_cpuset(name: &str) {
     if name.is_empty() || name.contains('/') {
         return;
     }
     let leaked: &'static str = Box::leak(format!("/dev/cpuset/{}", name).into_boxed_str());
-    *BASE_CPUSET_PATH.write().unwrap() = leaked;
+    *BASE_CPUSET_PATH.write().unwrap_or_else(|e| e.into_inner()) = leaked;
+    invalidate_tasks_files(None);
 }
 
 pub fn base_cpuset() -> &'static str {
-    *BASE_CPUSET_PATH.read().unwrap()
+    *BASE_CPUSET_PATH.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// cpuset tasks 文件路径；目录名为空表示基目录
+pub fn tasks_path(dir: &str) -> String {
+    if dir.is_empty() {
+        format!("{}/tasks", base_cpuset())
+    } else {
+        format!("{}/{}/tasks", base_cpuset(), dir)
+    }
+}
+
+/// 获取可追加写的 tasks 文件句柄（带缓存）
+pub fn tasks_file(path: &str) -> Option<Arc<File>> {
+    if let Some(file) = lock_ignore_poison(&TASKS_FILES).get(path) {
+        return Some(file.clone());
+    }
+    let file = Arc::new(File::options().append(true).open(path).ok()?);
+    lock_ignore_poison(&TASKS_FILES).insert(path.to_string(), file.clone());
+    Some(file)
+}
+
+/// 失效缓存的 tasks 句柄。目录被删除或重建后必须调用，
+/// 否则写入会落到已删除的 inode 上而静默失效。
+pub fn invalidate_tasks_files(path: Option<&str>) {
+    let mut guard = lock_ignore_poison(&TASKS_FILES);
+    match path {
+        Some(p) => {
+            guard.remove(p);
+        }
+        None => guard.clear(),
+    }
 }
 
 const _: () = assert!(std::mem::size_of::<CpuSet>() == std::mem::size_of::<libc::cpu_set_t>());
@@ -209,6 +247,7 @@ pub fn parse_cpu_spec(spec: &str, topo: &CpuTopology) -> CpuSet {
     set
 }
 pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
+    invalidate_tasks_files(Some(&format!("{}/tasks", path)));
     let c_path = CString::new(path).expect("cpuset path 受控输入，无 NUL");
     let ret = unsafe { libc::mkdir(c_path.as_ptr(), 0o755) };
     if ret != 0 {
@@ -245,6 +284,7 @@ pub(crate) fn remove_cpuset_dir(name: &str) -> bool {
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
         return false;
     }
+    invalidate_tasks_files(None);
     let root = "/dev/cpuset";
     let root_c = CString::new(root).expect("常量字符串无 NUL");
     if unsafe { libc::access(root_c.as_ptr(), libc::F_OK) } != 0 {

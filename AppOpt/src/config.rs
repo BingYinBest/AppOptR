@@ -22,6 +22,8 @@ pub struct AffinityRule {
     pub pkg: String,
     pub thread: String,
     pub thread_pattern: CString,
+    /// 线程名含通配符，匹配时需要走 fnmatch
+    pub is_pattern: bool,
     pub cpus: CpuSet,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +57,21 @@ pub struct DynRule {
     pub thread: String,
     pub thread_pattern: CString,
     pub spec: DynSpec,
+    /// 动态规则组的稳定标识，配置热加载后规则下标会变，组标识必须保持不变
+    pub group_id: u64,
+}
+
+/// 由「包名 + 线程模式」派生动态组标识（FNV-1a 64 位）。
+/// 缓存中的组成员与选举获胜者以此为键，配置重载后不会串组。
+pub fn dyn_group_id(pkg: &str, thread: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in pkg.as_bytes().iter().chain([0u8].iter()).chain(thread.as_bytes()) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 #[derive(Debug, PartialEq)]
 pub enum ParsedRule {
@@ -62,15 +79,20 @@ pub enum ParsedRule {
     Dyn { pkg: String, thread: String, spec: DynSpec },
 }
 
+/// 包名 -> 规则下标列表
+pub type RuleIndex = HashMap<String, Vec<usize>>;
+/// 包名 -> 线程名 -> 规则下标列表（精确匹配线程名）
+pub type ExactThreadIndex = HashMap<String, HashMap<String, Vec<usize>>>;
+
 pub struct AppConfig {
     pub rules: Vec<AffinityRule>,
     pub pkgs: HashSet<String>,
     pub has_thread_rules: HashSet<String>,
     pub topo: CpuTopology,
-    pub rules_by_pkg: HashMap<String, Vec<usize>>,
-    pub exact_thread_rules: HashMap<String, HashMap<String, Vec<usize>>>,
+    pub rules_by_pkg: RuleIndex,
+    pub exact_thread_rules: ExactThreadIndex,
     pub dyn_rules: Vec<DynRule>,
-    pub dyn_by_pkg: HashMap<String, Vec<usize>>,
+    pub dyn_by_pkg: RuleIndex,
     pub has_dyn_rules: HashSet<String>,
     pub cpuset_dirs: Mutex<HashMap<CpuSet, String>>,
     pub comm_prefixes: HashSet<String>,
@@ -261,154 +283,221 @@ fn parse_rule_entry(
         set,
     })
 }
-fn parse_rules(content: &str, topo: &CpuTopology) -> (Vec<ParsedRule>, usize) {
-    let mut rules: Vec<ParsedRule> = Vec::new();
-    let mut fail_cnt: usize = 0;
-    let mut cur_pkg = String::new();
-    let mut pending_pkg = String::new();
-    let mut in_block = false;
+/// 规则解析器：逐行累积规则并统计无效行
+struct RuleParser<'a> {
+    topo: &'a CpuTopology,
+    rules: Vec<ParsedRule>,
+    fails: usize,
+    /// 当前块所属包名
+    cur_pkg: String,
+    /// 形如 `com.a` 的待补全包名，下一行可能是 `{`
+    pending_pkg: String,
+    in_block: bool,
+}
 
-    for line in content.lines() {
-        let p = line.trim();
-        if p.is_empty() || p.starts_with('#') || p.starts_with("//") {
-            continue;
+impl<'a> RuleParser<'a> {
+    fn new(topo: &'a CpuTopology) -> Self {
+        Self {
+            topo,
+            rules: Vec::new(),
+            fails: 0,
+            cur_pkg: String::new(),
+            pending_pkg: String::new(),
+            in_block: false,
         }
+    }
 
-        if in_block {
-            if close_like(p) {
-                in_block = false;
-                cur_pkg.clear();
-                continue;
-            }
-            match split_rule_line(p) {
-                Some((thread, cpus, closed)) => {
-                    match parse_rule_entry(&cur_pkg, thread, cpus, topo) {
-                        Some(r) => rules.push(r),
-                        None => fail_cnt += 1,
-                    }
-                    if closed {
-                        in_block = false;
-                        cur_pkg.clear();
-                    }
-                }
-                None => {
-                    fail_cnt += 1;
-                    if p.contains('}') {
-                        in_block = false;
-                        cur_pkg.clear();
-                    }
-                }
-            }
-            continue;
+    /// 追加一条规则，格式非法时计入失败数
+    fn add(&mut self, pkg: &str, thread: &str, cpus: &str) {
+        match parse_rule_entry(pkg, thread, cpus, self.topo) {
+            Some(rule) => self.rules.push(rule),
+            None => self.fails += 1,
         }
+    }
 
-        match parse_outer(p) {
-            OuterLine::Single { pkg, thread, cpus, open } => {
-                if !pending_pkg.is_empty() {
-                    fail_cnt += 1;
+    /// 处理块内的一行
+    fn parse_in_block(&mut self, line: &str) {
+        if close_like(line) {
+            self.in_block = false;
+            self.cur_pkg.clear();
+            return;
+        }
+        match split_rule_line(line) {
+            Some((thread, cpus, closed)) => {
+                let pkg = self.cur_pkg.clone();
+                self.add(&pkg, thread, cpus);
+                if closed {
+                    self.in_block = false;
+                    self.cur_pkg.clear();
                 }
-                pending_pkg.clear();
-                match parse_rule_entry(pkg, thread, cpus, topo) {
-                    Some(r) => rules.push(r),
-                    None => fail_cnt += 1,
+            }
+            None => {
+                self.fails += 1;
+                if line.contains('}') {
+                    self.in_block = false;
+                    self.cur_pkg.clear();
                 }
+            }
+        }
+    }
+
+    /// 处理块外的一行
+    fn parse_outer_line(&mut self, line: &str) {
+        match parse_outer(line) {
+            OuterLine::Single {
+                pkg,
+                thread,
+                cpus,
+                open,
+            } => {
+                if !self.pending_pkg.is_empty() {
+                    self.fails += 1;
+                }
+                self.pending_pkg.clear();
+                self.add(pkg, thread, cpus);
                 if open {
-                    cur_pkg = pkg.to_string();
-                    in_block = true;
+                    self.cur_pkg = pkg.to_string();
+                    self.in_block = true;
                 }
             }
             OuterLine::Rule { pkg, cpus, open } => {
-                if !pending_pkg.is_empty() {
-                    fail_cnt += 1;
+                if !self.pending_pkg.is_empty() {
+                    self.fails += 1;
                 }
-                match parse_rule_entry(pkg, "", cpus, topo) {
-                    Some(r) => rules.push(r),
-                    None => fail_cnt += 1,
-                }
+                self.add(pkg, "", cpus);
                 if open {
-                    cur_pkg = pkg.to_string();
-                    in_block = true;
+                    self.cur_pkg = pkg.to_string();
+                    self.in_block = true;
                 }
-                pending_pkg.clear();
+                self.pending_pkg.clear();
             }
             OuterLine::BareOpen { pkg } => {
                 let owner = if !pkg.is_empty() {
-                    if !pending_pkg.is_empty() {
-                        fail_cnt += 1;
+                    if !self.pending_pkg.is_empty() {
+                        self.fails += 1;
                     }
                     pkg.to_string()
                 } else {
-                    pending_pkg.clone()
+                    self.pending_pkg.clone()
                 };
                 if owner.is_empty() {
-                    fail_cnt += 1;
-                    continue;
+                    self.fails += 1;
+                    return;
                 }
-                cur_pkg = owner;
-                pending_pkg.clear();
-                in_block = true;
+                self.cur_pkg = owner;
+                self.pending_pkg.clear();
+                self.in_block = true;
             }
             OuterLine::Pending { pkg } => {
-                if !pending_pkg.is_empty() {
-                    fail_cnt += 1;
+                if !self.pending_pkg.is_empty() {
+                    self.fails += 1;
                 }
-                pending_pkg = pkg.to_string();
+                self.pending_pkg = pkg.to_string();
             }
             OuterLine::Junk => {
-                fail_cnt += 1;
-                pending_pkg.clear();
+                self.fails += 1;
+                self.pending_pkg.clear();
             }
         }
     }
-
-    if in_block || !pending_pkg.is_empty() {
-        fail_cnt += 1;
-    }
-
-    (rules, fail_cnt)
 }
-pub fn load_config(
-    config_file: &str,
-    topo: &CpuTopology,
-) -> Option<AppConfig> {
-    let metadata = fs::metadata(config_file).ok()?;
-    let mtime = metadata
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos() as i64;
 
-    let last = LAST_MTIME.load(Ordering::Relaxed);
-    if last == mtime && last != -1 {
-        return None;
-    }
-
-    let content = fs::read_to_string(config_file).ok()?;
-
-    let (parsed, fail_cnt) = parse_rules(&content, topo);
-
-    let mut rules: Vec<AffinityRule> = Vec::new();
-    let mut dyn_rules: Vec<DynRule> = Vec::new();
-    for parsed in parsed {
-        match parsed {
-            ParsedRule::Static { pkg, thread, set, .. } => rules.push(AffinityRule {
-                pkg,
-                thread_pattern: CString::new(thread.as_str()).unwrap_or_default(),
-                cpus: set,
-                thread,
-            }),
-            ParsedRule::Dyn { pkg, thread, spec } => dyn_rules.push(DynRule {
-                thread_pattern: CString::new(thread.as_str()).unwrap_or_default(),
-                pkg,
-                thread,
-                spec,
-            }),
+fn parse_rules(content: &str, topo: &CpuTopology) -> (Vec<ParsedRule>, usize) {
+    let mut parser = RuleParser::new(topo);
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+            continue;
+        }
+        if parser.in_block {
+            parser.parse_in_block(line);
+        } else {
+            parser.parse_outer_line(line);
         }
     }
 
-    LAST_MTIME.store(mtime, Ordering::Relaxed);
-    PARSE_FAILS.store(fail_cnt, Ordering::Relaxed);
+    if parser.in_block || !parser.pending_pkg.is_empty() {
+        parser.fails += 1;
+    }
+
+    (parser.rules, parser.fails)
+}
+/// 拆分静态规则与动态规则
+fn split_rules(parsed: Vec<ParsedRule>) -> (Vec<AffinityRule>, Vec<DynRule>) {
+    let mut rules = Vec::new();
+    let mut dyn_rules = Vec::new();
+    for rule in parsed {
+        match rule {
+            ParsedRule::Static { pkg, thread, set } => {
+                let is_pattern = pattern_has_meta(&thread);
+                rules.push(AffinityRule {
+                    pkg,
+                    thread_pattern: CString::new(thread.as_str()).unwrap_or_default(),
+                    is_pattern,
+                    cpus: set,
+                    thread,
+                });
+            }
+            ParsedRule::Dyn { pkg, thread, spec } => {
+                let group_id = dyn_group_id(&pkg, &thread);
+                dyn_rules.push(DynRule {
+                    thread_pattern: CString::new(thread.as_str()).unwrap_or_default(),
+                    pkg,
+                    thread,
+                    spec,
+                    group_id,
+                });
+            }
+        }
+    }
+    (rules, dyn_rules)
+}
+
+/// 按包名建立规则索引，避免匹配时全量扫描
+fn build_rules_index(rules: &[AffinityRule]) -> (RuleIndex, ExactThreadIndex) {
+    let mut rules_by_pkg: RuleIndex = HashMap::new();
+    let mut exact_thread_rules: ExactThreadIndex = HashMap::new();
+    for (i, rule) in rules.iter().enumerate() {
+        rules_by_pkg
+            .entry(rule.pkg.clone())
+            .or_default()
+            .push(i);
+        if !rule.thread.is_empty() && !rule.is_pattern {
+            exact_thread_rules
+                .entry(rule.pkg.clone())
+                .or_default()
+                .entry(rule.thread.clone())
+                .or_default()
+                .push(i);
+        }
+    }
+    (rules_by_pkg, exact_thread_rules)
+}
+
+/// 长包名在内核 comm 中被截断到 15 字节，按前 15 / 后 15 字节建索引
+fn build_comm_keys(pkgs: &HashSet<String>) -> (HashSet<String>, HashSet<String>) {
+    let mut prefixes = HashSet::new();
+    let mut suffixes = HashSet::new();
+    for pkg in pkgs {
+        if pkg.len() <= 15 {
+            continue;
+        }
+        if let Some(prefix) = pkg.get(..15) {
+            prefixes.insert(prefix.to_string());
+        }
+        if let Some(suffix) = pkg.get(pkg.len() - 15..) {
+            suffixes.insert(suffix.to_string());
+        }
+    }
+    (prefixes, suffixes)
+}
+
+fn build_config(
+    parsed: Vec<ParsedRule>,
+    fail_cnt: usize,
+    topo: &CpuTopology,
+) -> AppConfig {
+    let (rules, dyn_rules) = split_rules(parsed);
 
     let mut pkgs: HashSet<String> = rules.iter().map(|r| r.pkg.clone()).collect();
     pkgs.extend(dyn_rules.iter().map(|r| r.pkg.clone()));
@@ -418,43 +507,23 @@ pub fn load_config(
         .map(|r| r.pkg.clone())
         .collect();
     let has_dyn_rules: HashSet<String> = dyn_rules.iter().map(|r| r.pkg.clone()).collect();
-    let mut comm_prefixes: HashSet<String> = HashSet::new();
-    let mut comm_suffixes: HashSet<String> = HashSet::new();
-    for pkg in &pkgs {
-        if pkg.len() > 15 {
-            if let Some(pre) = pkg.get(..15) {
-                comm_prefixes.insert(pre.to_string());
-            }
-            if let Some(suf) = pkg.get(pkg.len() - 15..) {
-                comm_suffixes.insert(suf.to_string());
-            }
-        }
+    let (comm_prefixes, comm_suffixes) = build_comm_keys(&pkgs);
+    let (rules_by_pkg, exact_thread_rules) = build_rules_index(&rules);
+    let mut dyn_by_pkg: RuleIndex = HashMap::new();
+    for (i, rule) in dyn_rules.iter().enumerate() {
+        dyn_by_pkg.entry(rule.pkg.clone()).or_default().push(i);
     }
-    let mut rules_by_pkg: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut exact_thread_rules: HashMap<String, HashMap<String, Vec<usize>>> = HashMap::new();
-    for (i, r) in rules.iter().enumerate() {
-        rules_by_pkg.entry(r.pkg.clone()).or_default().push(i);
-        if !r.thread.is_empty() && !pattern_has_meta(&r.thread) {
-            exact_thread_rules
-                .entry(r.pkg.clone())
-                .or_default()
-                .entry(r.thread.clone())
-                .or_default()
-                .push(i);
-        }
-    }
-    let mut dyn_by_pkg: HashMap<String, Vec<usize>> = HashMap::new();
-    for (i, r) in dyn_rules.iter().enumerate() {
-        dyn_by_pkg.entry(r.pkg.clone()).or_default().push(i);
-    }
-    let num_rules = rules.len() + dyn_rules.len();
 
-    println!("配置文件解析完成，共加载 {} 条规则", num_rules);
+    PARSE_FAILS.store(fail_cnt, Ordering::Relaxed);
+    println!(
+        "配置文件解析完成，共加载 {} 条规则",
+        rules.len() + dyn_rules.len()
+    );
     if fail_cnt > 0 {
         eprintln!("警告: {} 条规则因格式无效被跳过", fail_cnt);
     }
 
-    Some(AppConfig {
+    AppConfig {
         rules,
         pkgs,
         has_thread_rules,
@@ -467,7 +536,44 @@ pub fn load_config(
         cpuset_dirs: Mutex::new(HashMap::new()),
         comm_prefixes,
         comm_suffixes,
-    })
+    }
+}
+
+/// 读取并解析配置文件；mtime 未变化且非强制时返回 None，避免重复解析
+fn load_config_inner(
+    config_file: &str,
+    topo: &CpuTopology,
+    force: bool,
+) -> Option<AppConfig> {
+    let metadata = fs::metadata(config_file).ok()?;
+    let mtime = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as i64;
+
+    if !force {
+        let last = LAST_MTIME.load(Ordering::Relaxed);
+        if last == mtime && last != -1 {
+            return None;
+        }
+    }
+
+    let content = fs::read_to_string(config_file).ok()?;
+    let (parsed, fail_cnt) = parse_rules(&content, topo);
+    LAST_MTIME.store(mtime, Ordering::Relaxed);
+
+    Some(build_config(parsed, fail_cnt, topo))
+}
+
+pub fn load_config(config_file: &str, topo: &CpuTopology) -> Option<AppConfig> {
+    load_config_inner(config_file, topo, false)
+}
+
+/// 强制重新解析（忽略 mtime 短路），用于配置被程序自身改写后立即生效
+pub fn load_config_forced(config_file: &str, topo: &CpuTopology) -> Option<AppConfig> {
+    load_config_inner(config_file, topo, true)
 }
 
 pub fn config_loader() {
@@ -479,17 +585,16 @@ pub fn config_loader() {
     loop {
         let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
         if FORCE_RELOAD.swap(false, Ordering::AcqRel) {
-            LAST_MTIME.store(-1, Ordering::Relaxed);
             if INOTIFY_SUPPORTED.load(Ordering::Acquire) {
                 let fd = INOTIFY_FD.load(Ordering::Acquire);
                 inotify_rewatch(fd);
             }
-            config_reload();
+            config_reload(true);
         }
         if INOTIFY_SUPPORTED.load(Ordering::Acquire) {
             inotify_handle(interval);
         } else {
-            config_reload();
+            config_reload(false);
             thread::sleep(Duration::from_secs(interval));
         }
     }
@@ -538,12 +643,17 @@ fn disable_inotify(inotify_fd: i32) {
     INOTIFY_WD.store(-1, Ordering::Release);
 }
 
-fn config_reload() {
+fn config_reload(force: bool) {
     let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
         return;
     };
     let file = lock_ignore_poison(&CONFIG_FILE).clone();
-    let Some(new_cfg) = load_config(&file, &cfg.topo) else {
+    let new_cfg = if force {
+        load_config_forced(&file, &cfg.topo)
+    } else {
+        load_config(&file, &cfg.topo)
+    };
+    let Some(new_cfg) = new_cfg else {
         return;
     };
     {
@@ -553,8 +663,9 @@ fn config_reload() {
     CONFIG_UPDATED.store(true, Ordering::Release);
 }
 
+/// 面板写盘后立即生效：强制忽略 mtime 短路，兼容低精度时间戳的文件系统
 pub fn config_reload_now() {
-    config_reload();
+    config_reload(true);
 }
 
 fn inotify_handle(interval: u64) {
@@ -630,7 +741,7 @@ fn inotify_handle(interval: u64) {
     }
 
     if reload_needed {
-        config_reload();
+        config_reload(false);
     }
 }
 
@@ -673,6 +784,34 @@ mod tests {
             thread: thread.to_string(),
             set: parse_cpu_spec(cpus, &test_topo()),
         }
+    }
+
+    #[test]
+    fn dyn_group_id_is_stable_and_distinct() {
+        let first = dyn_group_id("com.a", "Thread-*");
+        assert_eq!(first, dyn_group_id("com.a", "Thread-*"));
+        assert_ne!(first, dyn_group_id("com.a", "Worker-*"));
+        assert_ne!(first, dyn_group_id("com.b", "Thread-*"));
+    }
+
+    #[test]
+    fn forced_reload_ignores_mtime() {
+        let path = std::env::temp_dir()
+            .join(format!("appopt_cfg_{}.conf", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = fs::remove_file(&path);
+        fs::write(&path, "com.a=0-1\n").unwrap();
+        let topo = test_topo();
+
+        assert!(load_config(&path, &topo).is_some(), "首次加载应成功");
+        assert!(load_config(&path, &topo).is_none(), "mtime 未变应短路");
+        assert!(
+            load_config_forced(&path, &topo).is_some(),
+            "强制重载不应受 mtime 短路影响"
+        );
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

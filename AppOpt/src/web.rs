@@ -14,7 +14,7 @@ use crate::apply_affinity::{proc_snapshot, read_cmdline, task_tids, tid_comm};
 use crate::cache::ProcCache;
 use crate::config::{
     config_reload_now, dyn_spec_try, spec_like,
-    CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, FORCE_RELOAD, PARSE_FAILS,
+    CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, DynSpec, FORCE_RELOAD, PARSE_FAILS,
 };
 use crate::cpuset::{
     base_cpuset, create_cpuset_dir, parse_cpu_spec, remove_cpuset_dir, set_base_cpuset, CpuSet,
@@ -264,14 +264,14 @@ fn spec_name(cpus: &CpuSet, topo: &CpuTopology) -> String {
     }
     cpus.to_range_string()
 }
-fn dyn_spec_str(spec: &crate::config::DynSpec, topo: &CpuTopology) -> String {
+fn dyn_spec_str(spec: &DynSpec, topo: &CpuTopology) -> String {
     match spec {
-        crate::config::DynSpec::Elect { winner, others } => format!(
+        DynSpec::Elect { winner, others } => format!(
             "elect({} | {})",
             spec_name(winner, topo),
             spec_name(others, topo)
         ),
-        crate::config::DynSpec::Load {
+        DynSpec::Load {
             high,
             low,
             threshold,
@@ -622,10 +622,13 @@ fn config_set_api(req: &Request) -> (u16, String) {
         if old != base_cpuset() {
             remove_cpuset_dir(old.rsplit('/').next().unwrap_or_default());
         }
-        if let Some(cfg) = current_cfg()
-            && cfg.topo.cpuset_enabled {
+        if let Some(cfg) = current_cfg() {
+            // 改名后旧目录已删除，子目录缓存必须失效，否则会写入不存在的目录
+            lock_ignore_poison(&cfg.cpuset_dirs).clear();
+            if cfg.topo.cpuset_enabled {
                 create_cpuset_dir(base_cpuset(), &cfg.topo.present_str, &cfg.topo.mems_str);
             }
+        }
         FORCE_RELOAD.store(true, Ordering::Release);
     }
     if let Some(p) = path {

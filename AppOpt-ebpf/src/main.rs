@@ -20,6 +20,7 @@ const EVENT_EXIT: u32 = 4;
 struct TracepointOffsets {
     fork_child_pid: u32,
     fork_child_comm: u32,
+    fork_child_tgid: u32,
     rename_newcomm: u32,
 }
 
@@ -29,6 +30,7 @@ struct ProcEvent {
     tid: i32,
     comm: [u8; 16],
     event_type: u32,
+    child_tgid: i32,
 }
 
 const MAP_CAPACITY: u32 = 16 << 5;
@@ -65,6 +67,7 @@ struct EventMeta {
     tid: i32,
     comm: [u8; 16],
     parent_tid: u32,
+    child_tgid: i32,
 }
 
 #[inline(always)]
@@ -105,11 +108,18 @@ fn fork_parse(ctx: &TracePointContext, offsets: &TracepointOffsets) -> EventMeta
     let child_pid = unsafe { ctx.read_at::<i32>(offsets.fork_child_pid as usize).unwrap_or(0) };
     let child_comm =
         unsafe { ctx.read_at::<[u8; 16]>(offsets.fork_child_comm as usize).unwrap_or([0u8; 16]) };
+    // child_tgid 与父进程 tgid 相同即为线程创建，用户态据此区分线程与子进程
+    let child_tgid = if offsets.fork_child_tgid != 0 {
+        unsafe { ctx.read_at::<i32>(offsets.fork_child_tgid as usize).unwrap_or(0) }
+    } else {
+        0
+    };
     EventMeta {
         pid: parent_tgid as i32,
         tid: child_pid,
         comm: child_comm,
         parent_tid,
+        child_tgid,
     }
 }
 
@@ -121,6 +131,7 @@ fn exec_parse() -> EventMeta {
         tid: pid_tgid as i32,
         comm: bpf_get_current_comm().unwrap_or_default(),
         parent_tid: 0,
+        child_tgid: 0,
     }
 }
 
@@ -154,6 +165,7 @@ fn report_named_event(ctx: &TracePointContext, event_type: u32) -> u32 {
         tid: meta.tid,
         comm: meta.comm,
         event_type,
+        child_tgid: meta.child_tgid,
     });
     0
 }
@@ -194,6 +206,7 @@ fn task_rename(ctx: TracePointContext) -> u32 {
         tid: tid as i32,
         comm: new_comm,
         event_type: EVENT_RENAME,
+        child_tgid: 0,
     });
     0
 }
@@ -215,6 +228,7 @@ fn sched_process_exit(_ctx: TracePointContext) -> u32 {
         tid: tid as i32,
         comm: [0u8; 16],
         event_type: EVENT_EXIT,
+        child_tgid: 0,
     });
     0
 }

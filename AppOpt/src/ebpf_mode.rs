@@ -19,6 +19,8 @@ pub struct EbpfProcEvent {
     pub tid: i32,
     pub comm: [u8; 16],
     pub event_type: u32,
+    /// fork 事件中子进程的 tgid；与 pid 相等表示线程创建，与 0 表示内核未提供
+    pub child_tgid: i32,
 }
 
 pub const EBPF_EVENT_FORK: u32 = 1;
@@ -30,6 +32,7 @@ pub const EBPF_EVENT_EXIT: u32 = 4;
 struct EbpfOffsets {
     fork_child_pid: u32,
     fork_child_comm: u32,
+    fork_child_tgid: u32,
     rename_newcomm: u32,
 }
 
@@ -37,6 +40,27 @@ unsafe impl Pod for EbpfOffsets {}
 fn comm_str(comm: &[u8; 16]) -> &str {
     let end = comm.iter().position(|&b| b == 0).unwrap_or(16);
     std::str::from_utf8(&comm[..end]).unwrap_or("").trim()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fork_event(child_tgid: i32) -> EbpfProcEvent {
+        EbpfProcEvent {
+            pid: 100,
+            tid: 101,
+            comm: [0u8; 16],
+            event_type: EBPF_EVENT_FORK,
+            child_tgid,
+        }
+    }
+
+    #[test]
+    fn fork_is_thread_when_child_tgid_matches_parent() {
+        assert!(is_thread_fork(&fork_event(100)));
+        assert!(!is_thread_fork(&fork_event(101)));
+    }
 }
 
 pub struct EbpfState {
@@ -117,8 +141,21 @@ fn comm_keys_build<'a, I: IntoIterator<Item = &'a String>>(pkgs: I) -> Vec<[u8; 
     entries.dedup();
     entries
 }
-// 返回 true 表示白名单装不下（需整体重载 eBPF），false 表示已原地更新
-pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32) -> bool {
+/// 白名单更新结果
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommMapUpdate {
+    /// 已原地更新，白名单生效
+    Updated,
+    /// 无法原地更新，需要重新加载 eBPF 程序
+    ReloadRequired,
+}
+
+// 更新内核侧包名白名单
+pub fn comm_map_init(
+    bpf: &mut Ebpf,
+    pkgs: &HashSet<String>,
+    comm_capacity: u32,
+) -> CommMapUpdate {
     let entries = comm_keys_build(pkgs.iter());
 
     if entries.len() > comm_capacity as usize {
@@ -127,18 +164,18 @@ pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32)
             entries.len(),
             comm_capacity
         );
-        return true;
+        return CommMapUpdate::ReloadRequired;
     }
 
     let Some(map) = bpf.map_mut("TARGET_COMM_MAP") else {
-        eprintln!("eBPF: 未找到 TARGET_COMM_MAP");
-        return false;
+        eprintln!("eBPF: 未找到 TARGET_COMM_MAP，触发内核端重载");
+        return CommMapUpdate::ReloadRequired;
     };
     let mut target_map = match AyaHashMap::<_, [u8; 15], u32>::try_from(map) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("eBPF: TARGET_COMM_MAP 类型转换失败 ({})", e);
-            return false;
+            eprintln!("eBPF: TARGET_COMM_MAP 类型转换失败 ({})，触发内核端重载", e);
+            return CommMapUpdate::ReloadRequired;
         }
     };
 
@@ -160,7 +197,7 @@ pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32)
             count,
             entries.len()
         );
-        return true;
+        return CommMapUpdate::ReloadRequired;
     }
 
     println!(
@@ -168,7 +205,7 @@ pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32)
         pkgs.len(),
         count
     );
-    false
+    CommMapUpdate::Updated
 }
 fn tracefs_root() -> Option<&'static str> {
     if fs::metadata("/sys/kernel/tracing").is_ok() {
@@ -217,6 +254,8 @@ fn offsets_inject(bpf: &mut Ebpf) -> bool {
         Some(EbpfOffsets {
             fork_child_pid: *fork_fields.get("child_pid")?,
             fork_child_comm: *fork_fields.get("child_comm")?,
+            // 老内核可能没有 child_tgid 字段，缺失时回退到 /proc 判定线程
+            fork_child_tgid: fork_fields.get("child_tgid").copied().unwrap_or(0),
             rename_newcomm: *rename_fields.get("newcomm")?,
         })
     })();
@@ -242,8 +281,12 @@ fn offsets_inject(bpf: &mut Ebpf) -> bool {
     }
 
     println!(
-        "eBPF: tracepoint 偏移注入 [{}] fork[child_pid={}, child_comm={}] rename[newcomm={}]",
-        root, offsets.fork_child_pid, offsets.fork_child_comm, offsets.rename_newcomm
+        "eBPF: tracepoint 偏移注入 [{}] fork[child_pid={}, child_comm={}, child_tgid={}] rename[newcomm={}]",
+        root,
+        offsets.fork_child_pid,
+        offsets.fork_child_comm,
+        offsets.fork_child_tgid,
+        offsets.rename_newcomm
     );
     true
 }
@@ -420,9 +463,9 @@ fn applied_get(bpf: &mut Ebpf) -> Option<AyaHashMap<&mut aya::maps::MapData, u32
     AyaHashMap::<_, u32, u64>::try_from(bpf.map_mut("APPLIED_MAP")?).ok()
 }
 
-fn applied_set(bpf: &mut Ebpf, tid: i32, cpus: &CpuSet) {
+fn applied_set(bpf: &mut Ebpf, tid: i32) {
     let Some(mut applied) = applied_get(bpf) else { return };
-    if let Err(e) = applied.insert(tid as u32, cpus.bits[0], 0) {
+    if let Err(e) = applied.insert(tid as u32, 1, 0) {
         eprintln!("eBPF: APPLIED_MAP 插入失败 tid={} ({})，map 可能已满", tid, e);
     }
 }
@@ -461,10 +504,19 @@ fn affinity_apply(
 ) -> bool {
     let dead = affinity_set(tid, cpus, cpuset_dir, &cfg.topo);
     if !dead {
-        applied_set(bpf, tid, cpus);
+        applied_set(bpf, tid);
     }
     dead
 }
+/// 判断 fork 事件是否为线程创建：子进程 tgid 与父进程 tgid 相同即为线程
+fn is_thread_fork(event: &EbpfProcEvent) -> bool {
+    if event.child_tgid != 0 {
+        return event.child_tgid == event.pid;
+    }
+    // 内核未提供 child_tgid 时回退到 /proc 查询
+    tid_tgid(event.tid) == Some(event.pid)
+}
+
 pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfState) {
     let tid = event.tid;
     let pid = event.pid;
@@ -483,7 +535,7 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
             }
 
         EBPF_EVENT_FORK
-            if tid_tgid(tid) == Some(pid)
+            if is_thread_fork(event)
                 && !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) => {
                 state.cache.task_del(tid);
                 applied_del(&mut state.bpf, tid);

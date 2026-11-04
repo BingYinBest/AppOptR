@@ -31,22 +31,24 @@ impl ProcScanState {
         self.force_affinity = true;
     }
 }
-pub fn proc_diff(cfg: &AppConfig, state: &mut ProcScanState) {
-    let Some(snapshot) = proc_snapshot() else {
-        return;
-    };
+/// 清理已退出的进程
+fn remove_dead(state: &mut ProcScanState, snapshot: &HashSet<i32>) -> bool {
+    let removed: HashSet<i32> = state.last_snapshot.difference(snapshot).copied().collect();
+    if removed.is_empty() {
+        return false;
+    }
+    state.tracked_pids.retain(|pid, _| !removed.contains(pid));
+    state.cache.remove_pkgs(&removed);
+    true
+}
 
-    let mut changed = false;
-    let removed: HashSet<i32> = state.last_snapshot.difference(&snapshot).copied().collect();
-    if !removed.is_empty() {
-        state.tracked_pids.retain(|pid, _| !removed.contains(pid));
-        state.cache.remove_pkgs(&removed);
-        changed = true;
-    }
-    let reconcile = state.last_reconcile.elapsed() >= RECONCILE_INTERVAL;
-    if reconcile {
-        state.last_reconcile = Instant::now();
-    }
+/// 纳管新出现的进程
+fn collect_new(
+    cfg: &AppConfig,
+    state: &mut ProcScanState,
+    snapshot: &HashSet<i32>,
+    reconcile: bool,
+) -> bool {
     let candidates: Vec<i32> = if reconcile {
         snapshot
             .iter()
@@ -56,6 +58,7 @@ pub fn proc_diff(cfg: &AppConfig, state: &mut ProcScanState) {
     } else {
         snapshot.difference(&state.last_snapshot).copied().collect()
     };
+    let mut changed = false;
     for pid in candidates {
         let Some(pkg) = read_cmdline(pid).or_else(|| tid_comm(pid)) else {
             continue;
@@ -68,32 +71,64 @@ pub fn proc_diff(cfg: &AppConfig, state: &mut ProcScanState) {
             changed = true;
         }
     }
-    if reconcile {
-        let tracked: Vec<(i32, String)> = state.tracked_pids.clone().into_iter().collect();
-        for (pid, pkg) in tracked {
-            match read_cmdline(pid).or_else(|| tid_comm(pid)) {
-                Some(p) if cfg.pkgs.contains(&p) => {
-                    if p != pkg {
-                        state.tracked_pids.insert(pid, p.clone());
-                    }
-                    if proc_tasks(pid, &p, cfg, &mut state.cache) {
-                        changed = true;
-                    }
+    changed
+}
+
+/// 复核已纳管进程：包名可能变化（如应用自改名），不匹配的进程应移除
+fn reconcile_tracked(cfg: &AppConfig, state: &mut ProcScanState) -> bool {
+    let tracked: Vec<(i32, String)> = state
+        .tracked_pids
+        .iter()
+        .map(|(pid, pkg)| (*pid, pkg.clone()))
+        .collect();
+    let mut changed = false;
+    for (pid, pkg) in tracked {
+        match read_cmdline(pid).or_else(|| tid_comm(pid)) {
+            Some(current) if cfg.pkgs.contains(&current) => {
+                if current != pkg {
+                    state.tracked_pids.insert(pid, current.clone());
                 }
-                _ => {
-                    state.tracked_pids.remove(&pid);
-                    state.cache.remove_pkgs(&HashSet::from([pid]));
+                if proc_tasks(pid, &current, cfg, &mut state.cache) {
                     changed = true;
                 }
             }
-        }
-    } else {
-        for (pid, pkg) in &state.tracked_pids {
-            if proc_tasks(*pid, pkg, cfg, &mut state.cache) {
+            _ => {
+                state.tracked_pids.remove(&pid);
+                state.cache.remove_pkgs(&HashSet::from([pid]));
                 changed = true;
             }
         }
     }
+    changed
+}
+
+/// 常规轮询：刷新已纳管进程的线程集合
+fn refresh_tracked(cfg: &AppConfig, state: &mut ProcScanState) -> bool {
+    let mut changed = false;
+    for (pid, pkg) in &state.tracked_pids {
+        if proc_tasks(*pid, pkg, cfg, &mut state.cache) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+pub fn proc_diff(cfg: &AppConfig, state: &mut ProcScanState) {
+    let Some(snapshot) = proc_snapshot() else {
+        return;
+    };
+    let reconcile = state.last_reconcile.elapsed() >= RECONCILE_INTERVAL;
+    if reconcile {
+        state.last_reconcile = Instant::now();
+    }
+
+    let mut changed = remove_dead(state, &snapshot);
+    changed |= collect_new(cfg, state, &snapshot, reconcile);
+    changed |= if reconcile {
+        reconcile_tracked(cfg, state)
+    } else {
+        refresh_tracked(cfg, state)
+    };
 
     state.last_snapshot = snapshot;
     state.force_affinity |= changed;
@@ -112,15 +147,11 @@ fn proc_tasks(pid: i32, pkg: &str, cfg: &AppConfig, cache: &mut ProcCache) -> bo
     }
     for tid in &tids {
         let thread_name = if has_thread_rules {
-            if cache.tasks.contains_key(tid) {
-                cache
-                    .tasks
-                    .get(tid)
-                    .map(|e| e.comm.clone())
-                    .unwrap_or_default()
-            } else {
-                tid_comm(*tid).unwrap_or_default()
-            }
+            cache
+                .tasks
+                .get(tid)
+                .map(|e| e.comm.clone())
+                .unwrap_or_else(|| tid_comm(*tid).unwrap_or_default())
         } else {
             String::new()
         };

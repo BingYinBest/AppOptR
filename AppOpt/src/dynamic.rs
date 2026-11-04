@@ -1,5 +1,4 @@
-
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::FileExt;
@@ -7,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::apply_affinity::affinity_set;
 use crate::cache::ProcCache;
-use crate::config::{AppConfig, DynSpec};
+use crate::config::{AppConfig, DynRule, DynSpec};
 use crate::rule_match::{cpuset_dir_cached, fnmatch_c, AffinityResult};
 // 档位切换驻留时间与滞回参数；评估周期跟随检查间隔（CHECK_INTERVAL，默认 2s），负载采样窗口 >=1s
 const MIN_HOLD: Duration = Duration::from_secs(2);
@@ -36,7 +35,8 @@ impl DynTidState {
 }
 pub struct DynState {
     pub tids: HashMap<i32, DynTidState>,
-    pub winners: HashMap<usize, i32>,
+    /// 组标识 -> 当前获胜线程，键为动态组稳定标识
+    pub winners: HashMap<u64, i32>,
 }
 
 impl DynState {
@@ -143,12 +143,16 @@ fn thread_cpu_jiffies(pid: i32, tid: i32) -> Option<u64> {
     let stime: u64 = fields.get(12)?.parse().ok()?;
     Some(utime.saturating_add(stime))
 }
-pub fn dyn_group_of<'a>(cfg: &'a AppConfig, pkg: &str, comm: &str) -> Option<(usize, &'a DynSpec)> {
+pub fn dyn_group_of<'a>(
+    cfg: &'a AppConfig,
+    pkg: &str,
+    comm: &str,
+) -> Option<(u64, &'a DynSpec)> {
     let idxs = cfg.dyn_by_pkg.get(pkg)?;
-    for &gi in idxs {
-        let rule = &cfg.dyn_rules[gi];
+    for &idx in idxs {
+        let rule = &cfg.dyn_rules[idx];
         if fnmatch_c(&rule.thread_pattern, comm) {
-            return Some((gi, &rule.spec));
+            return Some((rule.group_id, &rule.spec));
         }
     }
     None
@@ -197,89 +201,130 @@ fn apply_tier(cache: &mut ProcCache, cfg: &AppConfig, tid: i32, want: u8, spec: 
     }
     1
 }
+/// 采样线程 CPU 时间，计算窗口内负载百分比
+fn sample_load(
+    states: &mut HashMap<i32, DynTidState>,
+    tid: i32,
+    pid: i32,
+    now: Instant,
+    clk_tck: u64,
+) -> (u32, bool) {
+    let Some(jiffies) = thread_cpu_jiffies(pid, tid) else {
+        let load = states.get(&tid).map(|s| s.load).unwrap_or(0);
+        return (load, false);
+    };
+    let st = states.entry(tid).or_insert_with(DynTidState::new);
+    let elapsed = now.duration_since(st.sampled_at);
+    let mut sampled = false;
+    if elapsed >= Duration::from_secs(1) {
+        let instant = load_pct_from(jiffies.saturating_sub(st.jiffies), elapsed.as_secs(), clk_tck);
+        st.load = if st.sampled {
+            ema_load(st.load, instant)
+        } else {
+            instant
+        };
+        st.sampled = true;
+        sampled = true;
+    }
+    st.jiffies = jiffies;
+    st.sampled_at = now;
+    (st.load, sampled)
+}
+
+/// 清理已不在当前配置中的动态组及其线程状态
+fn prune_groups(cfg: &AppConfig, cache: &mut ProcCache) {
+    let live_groups: HashSet<u64> = cfg.dyn_rules.iter().map(|r| r.group_id).collect();
+    cache.dyn_members.retain(|gid, set| {
+        set.retain(|tid| cache.tasks.contains_key(tid));
+        live_groups.contains(gid) && !set.is_empty()
+    });
+    let members: HashSet<i32> = cache.dyn_members.values().flatten().copied().collect();
+    cache.dyn_state.tids.retain(|tid, _| members.contains(tid));
+    cache.dyn_state.winners.retain(|_, tid| members.contains(tid));
+}
+
+/// 评估单个动态规则组，返回发生档位变化的线程数
+fn eval_group(
+    cfg: &AppConfig,
+    cache: &mut ProcCache,
+    pkg: &str,
+    rule: &DynRule,
+    now: Instant,
+    clk_tck: u64,
+) -> usize {
+    let gid = rule.group_id;
+    let Some(candidates) = cache.dyn_members.get(&gid) else {
+        return 0;
+    };
+    let mut members: Vec<(i32, u32)> = Vec::new();
+    let mut any_load = false;
+    for &tid in candidates {
+        let (pid, matched) = {
+            let Some(e) = cache.tasks.get(&tid) else {
+                continue;
+            };
+            (e.pid, e.pkg == pkg && fnmatch_c(&rule.thread_pattern, &e.comm))
+        };
+        if !matched {
+            continue;
+        }
+        let (load, sampled) = sample_load(&mut cache.dyn_state.tids, tid, pid, now, clk_tck);
+        any_load |= sampled;
+        members.push((tid, load));
+    }
+
+    let mut changed = 0;
+    match &rule.spec {
+        DynSpec::Elect { .. } => {
+            let cur = cache.dyn_state.winners.get(&gid).copied();
+            let held = cur
+                .and_then(|t| cache.dyn_state.tids.get(&t))
+                .map(|s| s.switch_at.elapsed() >= MIN_HOLD)
+                .unwrap_or(false);
+            if any_load
+                && let Some(new_w) = elect_decide(cur, &members, held, ELECT_SWITCH_PCT)
+                && cur != Some(new_w)
+            {
+                cache.dyn_state.winners.insert(gid, new_w);
+                for (tid, _) in &members {
+                    let tier = if *tid == new_w { 0 } else { 1 };
+                    changed += apply_tier(cache, cfg, *tid, tier, &rule.spec);
+                }
+            }
+        }
+        DynSpec::Load { threshold, .. } => {
+            for (tid, load) in members {
+                let held = cache
+                    .dyn_state
+                    .tids
+                    .get(&tid)
+                    .map(|s| s.switch_at.elapsed() >= MIN_HOLD)
+                    .unwrap_or(false);
+                let cur_tier = cache.dyn_state.tids.get(&tid).map(|s| s.tier).unwrap_or(1);
+                if let Some(new_tier) =
+                    load_decide(cur_tier, load, *threshold, LOAD_BAND_PCT, held)
+                {
+                    changed += apply_tier(cache, cfg, tid, new_tier, &rule.spec);
+                }
+            }
+        }
+    }
+    changed
+}
+
 pub fn dyn_eval(cfg: &AppConfig, cache: &mut ProcCache) -> usize {
     if cfg.dyn_rules.is_empty() {
         return 0;
     }
-    cache.dyn_state.tids.retain(|tid, _| cache.tasks.contains_key(tid));
-    cache.dyn_state.winners.retain(|_, tid| cache.tasks.contains_key(tid));
-    for set in cache.dyn_members.values_mut() {
-        set.retain(|tid| cache.tasks.contains_key(tid));
-    }
-    cache.dyn_members.retain(|_, set| !set.is_empty());
+    prune_groups(cfg, cache);
 
     let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
-    let mut changed = 0;
     let now = Instant::now();
-
+    let mut changed = 0;
     for (pkg, idxs) in &cfg.dyn_by_pkg {
-        for &gi in idxs {
-            let rule = &cfg.dyn_rules[gi];
-            let Some(candidates) = cache.dyn_members.get(&gi) else {
-                continue;
-            };
-            let mut members: Vec<(i32, u32)> = Vec::new();
-            let mut any_load = false;
-            for &tid in candidates {
-                let Some(e) = cache.tasks.get(&tid) else {
-                    continue;
-                };
-                if e.pkg != *pkg || !fnmatch_c(&rule.thread_pattern, &e.comm) {
-                    continue;
-                }
-                let st = cache.dyn_state.tids.entry(tid).or_insert_with(DynTidState::new);
-                if let Some(j) = thread_cpu_jiffies(e.pid, tid) {
-                    let elapsed = now.duration_since(st.sampled_at);
-                    if elapsed >= Duration::from_secs(1) {
-                        let instant = load_pct_from(j - st.jiffies, elapsed.as_secs(), clk_tck);
-                        if st.sampled {
-                            st.load = ema_load(st.load, instant);
-                        } else {
-                            st.load = instant;
-                            st.sampled = true;
-                        }
-                        any_load = true;
-                    }
-                    st.jiffies = j;
-                    st.sampled_at = now;
-                }
-                members.push((tid, st.load));
-            }
-
-            match &rule.spec {
-                DynSpec::Elect { .. } => {
-                    let cur = cache.dyn_state.winners.get(&gi).copied();
-                    let held = cur
-                        .and_then(|t| cache.dyn_state.tids.get(&t))
-                        .map(|s| s.switch_at.elapsed() >= MIN_HOLD)
-                        .unwrap_or(false);
-                    if any_load
-                        && let Some(new_w) = elect_decide(cur, &members, held, ELECT_SWITCH_PCT)
-                        && cur != Some(new_w)
-                    {
-                        cache.dyn_state.winners.insert(gi, new_w);
-                        for (tid, _) in &members {
-                            changed += apply_tier(cache, cfg, *tid, if *tid == new_w { 0 } else { 1 }, &rule.spec);
-                        }
-                    }
-                }
-                DynSpec::Load { threshold, .. } => {
-                    for (tid, load) in members {
-                        let held = cache
-                            .dyn_state
-                            .tids
-                            .get(&tid)
-                            .map(|s| s.switch_at.elapsed() >= MIN_HOLD)
-                            .unwrap_or(false);
-                        let cur_tier = cache.dyn_state.tids.get(&tid).map(|s| s.tier).unwrap_or(1);
-                        if let Some(new_tier) =
-                            load_decide(cur_tier, load, *threshold, LOAD_BAND_PCT, held)
-                        {
-                            changed += apply_tier(cache, cfg, tid, new_tier, &rule.spec);
-                        }
-                    }
-                }
-            }
+        for &idx in idxs {
+            let rule = &cfg.dyn_rules[idx];
+            changed += eval_group(cfg, cache, pkg, rule, now, clk_tck);
         }
     }
     changed
@@ -295,7 +340,7 @@ mod tests {
     use std::thread;
 
     use crate::cache::TaskEntry;
-    use crate::config::DynRule;
+    use crate::config::{dyn_group_id, DynRule};
     use crate::cpuset::{CpuSet, CpuTopology};
 
     #[test]
@@ -394,6 +439,7 @@ mod tests {
                 winner: Box::new(cpus_of(&[4, 5, 6, 7])),
                 others: Box::new(cpus_of(&[0, 1, 2, 3])),
             },
+            group_id: dyn_group_id("com.b", "Thread-*"),
         }];
         let mut dyn_by_pkg: HashMap<String, Vec<usize>> = HashMap::new();
         dyn_by_pkg.entry("com.b".to_string()).or_default().push(0);
@@ -436,6 +482,7 @@ mod tests {
                 low: Box::new(cpus_of(&[0, 1, 2, 3])),
                 threshold: 50,
             },
+            group_id: dyn_group_id("com.a", "Thread-*"),
         }];
         let mut dyn_by_pkg: HashMap<String, Vec<usize>> = HashMap::new();
         dyn_by_pkg.entry("com.a".to_string()).or_default().push(0);
@@ -503,6 +550,7 @@ mod tests {
 
         let pid = std::process::id() as i32;
         let cfg = dyn_load_cfg();
+        let gid = cfg.dyn_rules[0].group_id;
         let mut cache = ProcCache::new();
         for (tid, comm) in [(tid_busy, "Thread-1"), (tid_idle, "Thread-2")] {
             cache.tasks.insert(
@@ -516,8 +564,8 @@ mod tests {
                     is_thread_rule: true,
                 },
             );
-            cache.dyn_members.entry(0).or_default().insert(tid);
-            cache.tid_group.insert(tid, 0);
+            cache.dyn_members.entry(gid).or_default().insert(tid);
+            cache.tid_group.insert(tid, gid);
         }
 
         dyn_eval(&cfg, &mut cache);
@@ -572,6 +620,7 @@ mod tests {
 
         let pid = std::process::id() as i32;
         let cfg = dyn_elect_cfg();
+        let gid = cfg.dyn_rules[0].group_id;
         let mut cache = ProcCache::new();
         for (tid, comm) in [(tid_a, "Thread-1"), (tid_b, "Thread-2")] {
             cache.tasks.insert(
@@ -585,8 +634,8 @@ mod tests {
                     is_thread_rule: true,
                 },
             );
-            cache.dyn_members.entry(0).or_default().insert(tid);
-            cache.tid_group.insert(tid, 0);
+            cache.dyn_members.entry(gid).or_default().insert(tid);
+            cache.tid_group.insert(tid, gid);
         }
 
         dyn_eval(&cfg, &mut cache);
@@ -597,7 +646,7 @@ mod tests {
         thread::sleep(Duration::from_secs(2));
         dyn_eval(&cfg, &mut cache);
 
-        let winner = cache.dyn_state.winners.get(&0).copied();
+        let winner = cache.dyn_state.winners.get(&gid).copied();
         assert!(winner.is_some(), "有负载后应建立 winner");
         let w = winner.unwrap();
         assert_eq!(
@@ -617,7 +666,7 @@ mod tests {
         thread::sleep(Duration::from_secs(2));
         dyn_eval(&cfg, &mut cache);
         assert_eq!(
-            cache.dyn_state.winners.get(&0).copied(),
+            cache.dyn_state.winners.get(&gid).copied(),
             Some(w),
             "负载悬殊时 winner 应保持不换手"
         );

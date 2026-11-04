@@ -16,20 +16,43 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_AR="$NDK_BIN/llvm-ar"
 export CARGO_TARGET_X86_64_LINUX_ANDROID_AR="$NDK_BIN/llvm-ar"
 export CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER="$BPF_LINKER"
 
+# 累积缺失项，最后统一输出，避免逐条报错打断阅读
+ENV_MISSING=""
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 ||
+        ENV_MISSING="${ENV_MISSING}\n  - 缺少命令 $1：$2"
+}
+
+need_exec() {
+    [ -x "$1" ] ||
+        ENV_MISSING="${ENV_MISSING}\n  - 缺少可执行文件 $1：$2"
+}
+
+need_rust_target() {
+    rustup target list --installed 2>/dev/null | grep -qx "$1" ||
+        ENV_MISSING="${ENV_MISSING}\n  - 缺少 target $1：rustup target add $1"
+}
+
 check_env() {
-    local missing=0
-    command -v cargo >/dev/null 2>&1 || { echo "缺少 cargo（请先 rustup toolchain install stable）"; missing=1; }
-    command -v rustup >/dev/null 2>&1 || { echo "缺少 rustup（https://rustup.rs）"; missing=1; }
-    [ -x "$NDK_BIN/aarch64-linux-android24-clang" ] || { echo "缺少 NDK clang: $NDK_BIN/aarch64-linux-android24-clang"; missing=1; }
-    [ -x "$NDK_BIN/x86_64-linux-android24-clang" ] || { echo "缺少 NDK clang: $NDK_BIN/x86_64-linux-android24-clang"; missing=1; }
-    [ -x "$BPF_LINKER" ] || { echo "缺少 bpf-linker（下载 aya-rs/bpf-linker 预编译包，或设 BPF_LINKER 指向现有路径）"; missing=1; }
-    rustup target list --installed 2>/dev/null | grep -q '^aarch64-linux-android$' || { echo "缺少 target: rustup target add aarch64-linux-android"; missing=1; }
-    rustup target list --installed 2>/dev/null | grep -q '^x86_64-linux-android$' || { echo "缺少 target: rustup target add x86_64-linux-android"; missing=1; }
-    rustup toolchain list 2>/dev/null | grep -q nightly || { echo "缺少 nightly: rustup toolchain install nightly --component rust-src"; missing=1; }
-    rustup component list --toolchain nightly 2>/dev/null | grep -q '^rust-src' || { echo "缺少 nightly rust-src（eBPF build-std 需要）"; missing=1; }
-    if [ "$missing" -ne 0 ]; then
-        echo ""
-        echo "环境检查未通过，请先补齐上述工具。"
+    ENV_MISSING=""
+
+    need_cmd cargo "请先 rustup toolchain install stable"
+    need_cmd rustup "请先安装 https://rustup.rs"
+    need_exec "$NDK_BIN/aarch64-linux-android24-clang" "请安装 Android NDK（NDK=$NDK）"
+    need_exec "$NDK_BIN/x86_64-linux-android24-clang" "请安装 Android NDK（NDK=$NDK）"
+    need_exec "$BPF_LINKER" "请安装 bpf-linker，或用 BPF_LINKER 指向现有路径"
+
+    need_rust_target aarch64-linux-android
+    need_rust_target x86_64-linux-android
+
+    rustup toolchain list 2>/dev/null | grep -q nightly ||
+        ENV_MISSING="${ENV_MISSING}\n  - 缺少 nightly 工具链：rustup toolchain install nightly --component rust-src"
+    rustup component list --toolchain nightly 2>/dev/null | grep -q '^rust-src' ||
+        ENV_MISSING="${ENV_MISSING}\n  - 缺少 nightly rust-src（eBPF build-std 需要）：rustup component add rust-src --toolchain nightly"
+
+    if [ -n "$ENV_MISSING" ]; then
+        printf "环境检查未通过，请先补齐：%b\n" "$ENV_MISSING"
         exit 1
     fi
 }
