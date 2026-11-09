@@ -1,0 +1,584 @@
+use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::fs;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::mpsc;
+use std::thread;
+
+use aya::maps::{Array as AyaArray, HashMap as AyaHashMap};
+use aya::{programs::TracePoint as AyaTracePoint, Ebpf, EbpfLoader, Pod};
+
+use crate::platform::affinity::{affinity_set, proc_walk, task_tids, tid_comm, tid_tgid};
+use crate::engine::cache::ProcCache;
+use crate::config::{AppConfig, CURRENT_CONFIG};
+use crate::platform::cpuset::CpuSet;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EbpfProcEvent {
+    pub pid: i32,
+    pub tid: i32,
+    pub comm: [u8; 16],
+    pub event_type: u32,
+    pub child_tgid: i32,
+}
+
+pub const EBPF_EVENT_FORK: u32 = 1;
+pub const EBPF_EVENT_EXEC: u32 = 2;
+pub const EBPF_EVENT_RENAME: u32 = 3;
+pub const EBPF_EVENT_EXIT: u32 = 4;
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EbpfOffsets {
+    fork_child_pid: u32,
+    fork_child_comm: u32,
+    fork_child_tgid: u32,
+    rename_newcomm: u32,
+}
+
+unsafe impl Pod for EbpfOffsets {}
+fn comm_str(comm: &[u8; 16]) -> &str {
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(16);
+    std::str::from_utf8(&comm[..end]).unwrap_or("").trim()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fork_event(child_tgid: i32) -> EbpfProcEvent {
+        EbpfProcEvent {
+            pid: 100,
+            tid: 101,
+            comm: [0u8; 16],
+            event_type: EBPF_EVENT_FORK,
+            child_tgid,
+        }
+    }
+
+    #[test]
+    fn fork_is_thread_when_child_tgid_matches_parent() {
+        assert!(is_thread_fork(&fork_event(100)));
+        assert!(!is_thread_fork(&fork_event(101)));
+    }
+}
+
+pub struct EbpfState {
+    pub event_rx: mpsc::Receiver<Vec<EbpfProcEvent>>,
+    pub reader_thread: Option<thread::JoinHandle<()>>,
+    pub bpf: Ebpf,
+    pub cache: ProcCache,
+    pub wakeup_fd: RawFd,
+    pub comm_capacity: u32,
+}
+
+impl Drop for EbpfState {
+    fn drop(&mut self) {
+        if self.wakeup_fd >= 0 {
+            let val: u64 = 1;
+            unsafe {
+                libc::write(self.wakeup_fd, &val as *const u64 as *const _, 8);
+            }
+        }
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
+        if self.wakeup_fd >= 0 {
+            unsafe { libc::close(self.wakeup_fd); }
+        }
+    }
+}
+
+pub fn ebpf_probe() -> bool {
+    fs::metadata("/sys/kernel/btf/vmlinux").is_ok()
+}
+
+fn attach_tracepoint(bpf: &mut Ebpf, category: &str, name: &str, required: bool) -> bool {
+    let Some(prog) = bpf.program_mut(name) else {
+        if required {
+            eprintln!("eBPF: 未找到 {} 程序", name);
+        }
+        return false;
+    };
+    let Ok(tp): Result<&mut AyaTracePoint, _> = prog.try_into() else {
+        if required {
+            eprintln!("eBPF: {} 类型转换失败", name);
+        }
+        return false;
+    };
+    if let Err(e) = tp.load() {
+        if required {
+            eprintln!("eBPF: {} 加载失败 ({})", name, e);
+        }
+        return false;
+    }
+    if let Err(e) = tp.attach(category, name) {
+        if required {
+            eprintln!("eBPF: {} 附加失败 ({})", name, e);
+        }
+        return false;
+    }
+    true
+}
+fn comm_keys_build<'a, I: IntoIterator<Item = &'a String>>(pkgs: I) -> Vec<[u8; 15]> {
+    let mut entries: Vec<[u8; 15]> = Vec::new();
+    for pkg in pkgs {
+        let bytes = pkg.as_bytes();
+        if bytes.is_empty() {
+            continue;
+        }
+        let mut prefix = [0u8; 15];
+        let end = bytes.len().min(15);
+        prefix[..end].copy_from_slice(&bytes[..end]);
+        entries.push(prefix);
+        if bytes.len() > 15 {
+            let mut suffix = [0u8; 15];
+            suffix.copy_from_slice(&bytes[bytes.len() - 15..]);
+            entries.push(suffix);
+        }
+    }
+    entries.sort();
+    entries.dedup();
+    entries
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommMapUpdate {
+    Updated,
+    ReloadRequired,
+}
+
+pub fn comm_map_init(
+    bpf: &mut Ebpf,
+    pkgs: &HashSet<String>,
+    comm_capacity: u32,
+) -> CommMapUpdate {
+    let entries = comm_keys_build(pkgs.iter());
+
+    if entries.len() > comm_capacity as usize {
+        eprintln!(
+            "eBPF: 白名单容量不足（需 {} > 现 {}），触发内核端重载",
+            entries.len(),
+            comm_capacity
+        );
+        return CommMapUpdate::ReloadRequired;
+    }
+
+    let Some(map) = bpf.map_mut("TARGET_COMM_MAP") else {
+        eprintln!("eBPF: 未找到 TARGET_COMM_MAP，触发内核端重载");
+        return CommMapUpdate::ReloadRequired;
+    };
+    let mut target_map = match AyaHashMap::<_, [u8; 15], u32>::try_from(map) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("eBPF: TARGET_COMM_MAP 类型转换失败 ({})，触发内核端重载", e);
+            return CommMapUpdate::ReloadRequired;
+        }
+    };
+
+    let old_keys: Vec<[u8; 15]> = target_map.keys().filter_map(|r| r.ok()).collect();
+    for key in &old_keys {
+        let _ = target_map.remove(key);
+    }
+
+    let mut count = 0;
+    for key in &entries {
+        if target_map.insert(key, 1, 0).is_ok() {
+            count += 1;
+        }
+    }
+
+    if count < entries.len() {
+        eprintln!(
+            "eBPF: 白名单插入部分失败（{}/{}），触发重载",
+            count,
+            entries.len()
+        );
+        return CommMapUpdate::ReloadRequired;
+    }
+
+    println!(
+        "eBPF: 白名单已配置，{} 个包名 > {} 条匹配规则",
+        pkgs.len(),
+        count
+    );
+    CommMapUpdate::Updated
+}
+fn tracefs_root() -> Option<&'static str> {
+    if fs::metadata("/sys/kernel/tracing").is_ok() {
+        return Some("/sys/kernel/tracing");
+    }
+    if fs::metadata("/sys/kernel/debug/tracing").is_ok() {
+        return Some("/sys/kernel/debug/tracing");
+    }
+    None
+}
+fn tracepoint_parse(root: &str, category: &str, name: &str) -> Option<HashMap<String, u32>> {
+    let path = format!("{}/events/{}/{}/format", root, category, name);
+    let content = fs::read_to_string(&path).ok()?;
+    let mut offsets = HashMap::new();
+    for line in content.lines() {
+        let Some(rest) = line.trim().strip_prefix("field:") else {
+            continue;
+        };
+        let parts: Vec<&str> = rest.split(';').map(|s| s.trim()).collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let field_name = parts[0].split_whitespace().last().unwrap_or("").split('[').next().unwrap_or("");
+        if field_name.is_empty() {
+            continue;
+        }
+        for part in &parts[1..] {
+            if let Some(off_str) = part.strip_prefix("offset:")
+                && let Ok(off) = off_str.trim().parse::<u32>() {
+                    offsets.insert(field_name.to_string(), off);
+                    break;
+                }
+        }
+    }
+    Some(offsets)
+}
+fn offsets_inject(bpf: &mut Ebpf) -> bool {
+    let Some(root) = tracefs_root() else {
+        eprintln!("eBPF: tracefs 不可用，回退到 /proc 轮询");
+        return false;
+    };
+
+    let offsets = (|| {
+        let fork_fields = tracepoint_parse(root, "sched", "sched_process_fork")?;
+        let rename_fields = tracepoint_parse(root, "task", "task_rename")?;
+        Some(EbpfOffsets {
+            fork_child_pid: *fork_fields.get("child_pid")?,
+            fork_child_comm: *fork_fields.get("child_comm")?,
+            fork_child_tgid: fork_fields.get("child_tgid").copied().unwrap_or(0),
+            rename_newcomm: *rename_fields.get("newcomm")?,
+        })
+    })();
+    let Some(offsets) = offsets else {
+        eprintln!(
+            "eBPF: tracepoint format 解析失败 [{}]，回退到 /proc 轮询",
+            root
+        );
+        return false;
+    };
+
+    let Some(map) = bpf.map_mut("OFFSETS_MAP") else {
+        eprintln!("eBPF: 未找到 OFFSETS_MAP，回退到 /proc 轮询");
+        return false;
+    };
+    let Ok(mut offsets_map) = AyaArray::<_, EbpfOffsets>::try_from(map) else {
+        eprintln!("eBPF: OFFSETS_MAP 类型转换失败，回退到 /proc 轮询");
+        return false;
+    };
+    if offsets_map.set(0, offsets, 0).is_err() {
+        eprintln!("eBPF: OFFSETS_MAP 注入失败，回退到 /proc 轮询");
+        return false;
+    }
+
+    println!(
+        "eBPF: tracepoint 偏移注入 [{}] fork[child_pid={}, child_comm={}, child_tgid={}] rename[newcomm={}]",
+        root,
+        offsets.fork_child_pid,
+        offsets.fork_child_comm,
+        offsets.fork_child_tgid,
+        offsets.rename_newcomm
+    );
+    true
+}
+pub fn ebpf_init() -> Option<EbpfState> {
+    if !ebpf_probe() {
+        eprintln!("eBPF: 内核不支持（缺少 BTF），回退到 /proc 轮询");
+        return None;
+    }
+
+    let ebpf_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.join("AppOpt-ebpf")))?;
+
+    if !ebpf_path.exists() {
+        eprintln!("eBPF: 未找到 {}，回退到 /proc 轮询", ebpf_path.display());
+        return None;
+    }
+
+    let ebpf_data = match fs::read(&ebpf_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "eBPF: 读取 {} 失败 ({})，回退到 /proc 轮询",
+                ebpf_path.display(),
+                e
+            );
+            return None;
+        }
+    };
+
+    if ebpf_data.is_empty() {
+        eprintln!("eBPF: {} 文件为空，回退到 /proc 轮询", ebpf_path.display());
+        return None;
+    }
+
+    println!(
+        "eBPF: 从 {} 加载程序 ({} bytes)",
+        ebpf_path.display(),
+        ebpf_data.len()
+    );
+
+    let pkgs_len = crate::lock_ignore_poison(&CURRENT_CONFIG)
+        .as_ref()
+        .map(|cfg| cfg.pkgs.len())
+        .unwrap_or(0);
+    let capacity = (pkgs_len * 2).max(512).next_power_of_two() as u32;
+
+    let mut loader = EbpfLoader::new();
+    loader.map_max_entries("TARGET_COMM_MAP", capacity);
+    let mut bpf = match loader.load(&ebpf_data) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("eBPF: 加载失败 ({})，回退到 /proc 轮询", e);
+            return None;
+        }
+    };
+    if !offsets_inject(&mut bpf) {
+        return None;
+    }
+
+    if !attach_tracepoint(&mut bpf, "sched", "sched_process_fork", true) {
+        return None;
+    }
+    if !attach_tracepoint(&mut bpf, "sched", "sched_process_exec", true) {
+        return None;
+    }
+    if !attach_tracepoint(&mut bpf, "sched", "sched_process_exit", true) {
+        return None;
+    }
+    if !attach_tracepoint(&mut bpf, "task", "task_rename", true) {
+        return None;
+    }
+
+    let ring_buf = match bpf.take_map("EVENTS") {
+        Some(map) => match aya::maps::RingBuf::try_from(map) {
+            Ok(rb) => rb,
+            Err(e) => {
+                eprintln!("eBPF: EVENTS map 类型转换失败 ({})，回退到 /proc 轮询", e);
+                return None;
+            }
+        },
+        None => {
+            eprintln!("eBPF: 未找到 EVENTS map，回退到 /proc 轮询");
+            return None;
+        }
+    };
+
+    let (tx, rx) = mpsc::channel::<Vec<EbpfProcEvent>>();
+    let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if wakeup_fd < 0 {
+        eprintln!("eBPF: eventfd 创建失败，回退到 /proc 轮询");
+        return None;
+    }
+    let reader_thread = thread::spawn(move || {
+        ebpf_reader(ring_buf, tx, wakeup_fd);
+    });
+
+    println!("eBPF: 初始化成功");
+
+    Some(EbpfState {
+        event_rx: rx,
+        reader_thread: Some(reader_thread),
+        bpf,
+        cache: ProcCache::new(),
+        wakeup_fd,
+        comm_capacity: capacity,
+    })
+}
+fn ebpf_reader(
+    mut ring_buf: aya::maps::RingBuf<aya::maps::MapData>,
+    tx: mpsc::Sender<Vec<EbpfProcEvent>>,
+    wakeup_fd: RawFd,
+) {
+    let name = CString::new("EbpfReader").unwrap();
+    unsafe {
+        libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
+    }
+
+    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if epfd < 0 {
+        eprintln!("eBPF: epoll_create1 失败");
+        return;
+    }
+
+    let ring_fd = ring_buf.as_raw_fd();
+    let mut ring_ev: libc::epoll_event = unsafe { std::mem::zeroed() };
+    ring_ev.events = libc::EPOLLIN as u32;
+    ring_ev.u64 = 0;
+    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, ring_fd, &mut ring_ev) } < 0 {
+        eprintln!("eBPF: epoll_ctl ADD ring_fd 失败");
+        unsafe { libc::close(epfd) };
+        return;
+    }
+
+    let mut wake_ev: libc::epoll_event = unsafe { std::mem::zeroed() };
+    wake_ev.events = libc::EPOLLIN as u32;
+    wake_ev.u64 = 1;
+    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, wakeup_fd, &mut wake_ev) } < 0 {
+        eprintln!("eBPF: epoll_ctl ADD wakeup_fd 失败");
+        unsafe { libc::close(epfd) };
+        return;
+    }
+
+    let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
+    loop {
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, -1) };
+        if n <= 0 {
+            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+        if events.iter().take(n as usize).any(|e| e.u64 == 1) {
+            break;
+        }
+        let mut batch: Vec<EbpfProcEvent> = Vec::new();
+        while let Some(item) = ring_buf.next() {
+            let bytes: &[u8] = &item;
+            if bytes.len() >= std::mem::size_of::<EbpfProcEvent>() {
+                let event: EbpfProcEvent =
+                    unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const EbpfProcEvent) };
+                batch.push(event);
+            }
+        }
+        if !batch.is_empty() && tx.send(batch).is_err() {
+            unsafe { libc::close(epfd) };
+            return;
+        }
+    }
+    unsafe { libc::close(epfd) };
+}
+
+fn applied_get(bpf: &mut Ebpf) -> Option<AyaHashMap<&mut aya::maps::MapData, u32, u64>> {
+    AyaHashMap::<_, u32, u64>::try_from(bpf.map_mut("APPLIED_MAP")?).ok()
+}
+
+fn applied_set(bpf: &mut Ebpf, tid: i32) {
+    let Some(mut applied) = applied_get(bpf) else { return };
+    if let Err(e) = applied.insert(tid as u32, 1, 0) {
+        eprintln!("eBPF: APPLIED_MAP 插入失败 tid={} ({})，map 可能已满", tid, e);
+    }
+}
+
+fn applied_del(bpf: &mut Ebpf, tid: i32) {
+    let Some(mut applied) = applied_get(bpf) else { return };
+    let _ = applied.remove(&(tid as u32));
+}
+
+fn applied_clear(bpf: &mut Ebpf) {
+    let Some(mut m) = applied_get(bpf) else { return };
+    let keys: Vec<u32> = m.keys().filter_map(|r| r.ok()).collect();
+    for k in &keys {
+        let _ = m.remove(k);
+    }
+}
+pub fn dropped_take(bpf: &mut Ebpf) -> u32 {
+    let Some(map) = bpf.map_mut("DROPPED_COUNT") else {
+        return 0;
+    };
+    let Ok(mut m) = AyaHashMap::<_, u32, u32>::try_from(map) else {
+        return 0;
+    };
+    let v = m.get(&0, 0).ok().unwrap_or(0);
+    if v > 0 {
+        let _ = m.insert(0, 0, 0);
+    }
+    v
+}
+fn affinity_apply(
+    tid: i32,
+    cpus: &CpuSet,
+    cpuset_dir: &str,
+    cfg: &AppConfig,
+    bpf: &mut Ebpf,
+) -> bool {
+    let dead = affinity_set(tid, cpus, cpuset_dir, &cfg.topo);
+    if !dead {
+        applied_set(bpf, tid);
+    }
+    dead
+}
+fn is_thread_fork(event: &EbpfProcEvent) -> bool {
+    if event.child_tgid != 0 {
+        return event.child_tgid == event.pid;
+    }
+    tid_tgid(event.tid) == Some(event.pid)
+}
+
+pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfState) {
+    let tid = event.tid;
+    let pid = event.pid;
+    let comm = comm_str(&event.comm);
+
+    match event.event_type {
+        EBPF_EVENT_EXIT => {
+            state.cache.task_del(tid);
+            applied_del(&mut state.bpf, tid);
+        }
+
+        EBPF_EVENT_EXEC
+            if !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) => {
+                state.cache.task_del(tid);
+                applied_del(&mut state.bpf, tid);
+            }
+
+        EBPF_EVENT_FORK
+            if is_thread_fork(event)
+                && !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) => {
+                state.cache.task_del(tid);
+                applied_del(&mut state.bpf, tid);
+            }
+
+        EBPF_EVENT_RENAME
+            if !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) => {
+                state.cache.task_del(tid);
+                applied_del(&mut state.bpf, tid);
+            }
+
+        _ => {}
+    }
+}
+fn event_apply(
+    cache: &mut ProcCache,
+    bpf: &mut Ebpf,
+    tid: i32,
+    pid: i32,
+    comm: &str,
+    cfg: &AppConfig,
+) -> bool {
+    let Some(pkg) = cache.pkg_lookup_comm(pid, comm, cfg) else {
+        return false;
+    };
+
+    cache.task_apply(tid, pid, &pkg, comm, cfg, |t, c, d| {
+        affinity_apply(t, c, d, cfg, bpf)
+    })
+}
+pub fn affinity_check(state: &mut EbpfState, cfg: &AppConfig) {
+    let dead_tids = state.cache.affinity_sync(&cfg.topo);
+    for tid in dead_tids {
+        applied_del(&mut state.bpf, tid);
+    }
+}
+pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
+    state.cache.clear();
+    applied_clear(&mut state.bpf);
+
+    proc_walk(cfg, |_| true, |pid, pkg, has_thread_rules| {
+        let Some(tids) = task_tids(pid) else { return };
+        for tid in tids {
+            let t_name = if has_thread_rules || cfg.has_dyn_rules.contains(pkg) {
+                tid_comm(tid).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            state.cache.task_apply(tid, pid, pkg, &t_name, cfg, |tid, cpus, cpuset_dir| {
+                affinity_apply(tid, cpus, cpuset_dir, cfg, &mut state.bpf)
+            });
+        }
+    });
+}

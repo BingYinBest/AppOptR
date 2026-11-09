@@ -1,0 +1,1405 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#070A14">
+<title>AppOpt</title>
+<style>
+:root{
+--bg:#070A14;--fg:#F2F5FF;--sub:#A9B3C9;--dim:#707B95;
+--glass:rgba(255,255,255,.065);--glass2:rgba(255,255,255,.105);
+--stroke:rgba(255,255,255,.14);--stroke2:rgba(255,255,255,.22);
+--accent:#0A84FF;--accent2:#64D2FF;--amber:#FFB020;
+--green:#30D158;--teal:#40C8E0;--blue:#0A84FF;--violet:#BF5AF2;--red:#FF453A;
+--r-chip:10px;--r-card:22px;--r-pill:999px;
+--font:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Noto Sans CJK SC",system-ui,sans-serif;
+--mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+--blur:blur(14px) saturate(150%);
+--spring:cubic-bezier(.22,1.2,.36,1);
+--glow:0 1px 0 rgba(255,255,255,.18) inset,0 24px 48px -30px rgba(0,0,0,.75);
+--max-w:520px;--pad:16px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+[hidden]{display:none!important}
+html,body{height:100%}
+body{font-family:var(--font);background:#070A14;color:var(--fg);font-size:14px;line-height:1.5;-webkit-tap-highlight-color:transparent;overflow:hidden;
+font-feature-settings:"ss01" 1;background-image:radial-gradient(130% 90% at 50% -12%,#17233F 0%,#0B1122 46%,#070A14 100%)}
+body:before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
+background:
+radial-gradient(46% 34% at 18% 18%,rgba(10,132,255,.28),transparent 72%),
+radial-gradient(42% 32% at 86% 24%,rgba(191,90,242,.20),transparent 74%),
+radial-gradient(56% 42% at 58% 94%,rgba(100,210,255,.16),transparent 72%)}
+button{cursor:pointer;border:none;font-family:inherit;background:none;color:inherit}
+a{color:var(--accent2);text-decoration:none}
+.app{position:relative;max-width:var(--max-w);margin:0 auto;display:flex;flex-direction:column;height:100dvh;overflow:hidden;isolation:isolate}
+@media(max-width:560px){.app{width:100%;max-width:none}}
+.main{position:relative;flex:1;overflow:hidden;transition:transform .42s var(--spring);touch-action:pan-y}
+.panel{height:100%;overflow:auto;padding:0 var(--pad) 34px;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+.main>.panel{position:absolute;inset:0}
+.panel::-webkit-scrollbar{display:none}
+
+.glass{background:linear-gradient(150deg,rgba(255,255,255,.105),rgba(255,255,255,.035));backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur);border:1px solid var(--stroke);box-shadow:var(--glow)}
+
+/* ---------- header ---------- */
+.topbar{display:flex;align-items:center;gap:10px;padding:14px 2px 12px;flex-shrink:0}
+.mark{width:32px;height:32px;border-radius:11px;display:grid;place-items:center;
+background:linear-gradient(150deg,rgba(10,132,255,.55),rgba(100,210,255,.22));border:1px solid var(--stroke2);
+box-shadow:0 1px 0 rgba(255,255,255,.35) inset,0 10px 24px -14px rgba(10,132,255,.9)}
+.mark svg{width:16px;height:16px;stroke:#fff;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.brand{font-size:15px;font-weight:700;letter-spacing:.03em}
+.brand em{font-style:normal;color:var(--dim);font-weight:400;margin-left:6px;font-size:10.5px;letter-spacing:.14em;font-family:var(--mono)}
+.live{margin-left:auto;display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;color:var(--sub);
+border:1px solid var(--stroke);border-radius:var(--r-pill);padding:4px 11px 4px 9px;background:var(--glass);
+backdrop-filter:blur(18px) saturate(160%);-webkit-backdrop-filter:blur(18px) saturate(160%)}
+.dotlt{width:6px;height:6px;border-radius:50%;background:var(--accent2);box-shadow:0 0 8px rgba(100,210,255,.55)}
+
+/* ---------- hero ---------- */
+.hero-card{position:relative;overflow:hidden;border-radius:var(--r-card);border:1px solid var(--stroke);
+background:linear-gradient(160deg,rgba(255,255,255,.135),rgba(255,255,255,.04) 58%,rgba(255,255,255,.06));
+backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur);
+box-shadow:var(--glow);padding:16px 18px 14px;margin-bottom:12px}
+.hero-card:before{content:"";position:absolute;inset:0;pointer-events:none;
+background:radial-gradient(120% 80% at 8% -10%,rgba(255,255,255,.22),transparent 55%)}
+.hero-card:after{content:"";position:absolute;right:-52px;top:-64px;width:170px;height:170px;border-radius:50%;
+background:radial-gradient(circle,rgba(10,132,255,.32),transparent 66%);pointer-events:none}
+.eyebrow{position:relative;font-size:11px;letter-spacing:.16em;color:var(--sub);font-family:var(--mono);text-transform:uppercase}
+.hero-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:var(--r-pill);font-size:11px;font-weight:650;
+font-family:var(--mono);letter-spacing:.02em}
+.badge:before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor}
+.badge.ebpf{background:rgba(48,209,88,.16);color:#6BE39A;border:1px solid rgba(48,209,88,.32)}
+.badge.proc{background:rgba(10,132,255,.18);color:#8FC6FF;border:1px solid rgba(10,132,255,.36)}
+.upnum{position:relative;display:block;font-family:var(--mono);font-size:26px;font-weight:650;letter-spacing:-.01em;margin:12px 0 2px;font-variant-numeric:tabular-nums}
+.hero-meta{position:relative;font-size:11.5px;color:var(--sub);font-family:var(--mono)}
+.hero-meta b{color:var(--fg);font-weight:600}
+
+/* ---------- cards ---------- */
+.card{background:linear-gradient(155deg,rgba(22,28,46,.78),rgba(14,19,34,.62));
+border:1px solid var(--stroke);border-radius:var(--r-card);padding:14px;margin-bottom:12px;box-shadow:var(--glow)}
+.card-head{display:flex;align-items:baseline;gap:8px;margin-bottom:12px}
+.card-title{font-size:12px;letter-spacing:.1em;color:var(--sub);font-family:var(--mono);text-transform:uppercase}
+.card-note{margin-left:auto;font-size:11px;color:var(--dim);font-family:var(--mono)}
+
+/* ---------- cpu topology ---------- */
+.topo{display:flex;gap:3px;height:48px;margin-bottom:9px}
+.ts{position:relative;display:flex;align-items:flex-end;padding:7px 8px;border-radius:var(--r-chip);overflow:hidden;min-width:44px;
+border:1px solid rgba(255,255,255,.18);font-family:var(--mono);font-size:11px;font-weight:650;letter-spacing:.02em;
+transition:flex-grow .55s var(--spring),transform .3s var(--spring);box-shadow:0 1px 0 rgba(255,255,255,.3) inset}
+.ts:hover{transform:translateY(-2px)}
+.ts i{font-style:normal;position:relative;z-index:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#fff}
+.ts:before{content:"";position:absolute;inset:0;opacity:.38;background:linear-gradient(160deg,rgba(255,255,255,.55),transparent 62%)}
+.ts:after{content:"";position:absolute;inset:0;opacity:.9}
+.ts i{z-index:1}
+.ts.e:after{background:linear-gradient(180deg,rgba(48,209,88,.42),rgba(48,209,88,.16))}
+.ts.m:after{background:linear-gradient(180deg,rgba(64,200,224,.42),rgba(64,200,224,.16))}
+.ts.p:after{background:linear-gradient(180deg,rgba(10,132,255,.48),rgba(10,132,255,.18))}
+.ts.h:after{background:linear-gradient(180deg,rgba(191,90,242,.46),rgba(191,90,242,.18))}
+.ts.c:after{background:linear-gradient(180deg,rgba(170,180,200,.42),rgba(170,180,200,.16))}
+.ts.e{color:#8CF0B0}.ts.m{color:#8FE4F2}.ts.p{color:#9EC7FF}.ts.h{color:#D8A9FF}.ts.c{color:#D5DCEA}
+.topo-empty{height:48px;border-radius:var(--r-chip);border:1px dashed var(--stroke);display:grid;place-items:center;color:var(--dim);font-size:12px;font-family:var(--mono)}
+.topo-legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-family:var(--mono);font-size:11px;color:var(--sub)}
+.topo-legend span{display:inline-flex;align-items:center;gap:5px}
+.topo-legend span:before{content:"";width:7px;height:7px;border-radius:3px;background:currentColor;opacity:.9;box-shadow:0 0 8px currentColor}
+.topo-legend .e{color:#5EE38D}.topo-legend .m{color:#5FD6E8}.topo-legend .p{color:#5AA8FF}.topo-legend .h{color:#C77BFF}.topo-legend .c{color:#AAB4C8}
+
+/* ---------- stats ---------- */
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.stat{background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09);border-radius:14px;padding:12px 6px 10px;text-align:center;min-width:0;
+box-shadow:0 1px 0 rgba(255,255,255,.10) inset}
+.stat .num{font-family:var(--mono);font-size:20px;font-weight:650;height:1em;line-height:1em;overflow:hidden;display:flex;align-items:flex-start;justify-content:center;font-variant-numeric:tabular-nums}
+.num .dig{display:flex;flex-direction:column;transform:translateY(calc(-1em*var(--d,0)));transition:transform .55s var(--spring)}
+.num .dig i{height:1em;line-height:1em;font-style:normal;flex-shrink:0;text-align:center;min-width:.62em}
+@keyframes numIn{from{opacity:0;transform:translateY(.55em)}to{opacity:1;transform:none}}
+.num.num-in{animation:numIn .34s var(--spring) both}
+.stat .lbl{font-size:11px;color:var(--sub);margin-top:5px;letter-spacing:.04em;white-space:nowrap}
+.stat.warn .num{color:var(--amber)}
+.panel>.card:last-of-type{margin-bottom:20px}
+.foot{margin:6px 2px 0;text-align:center;font-family:var(--mono);font-size:10.5px;color:var(--dim);letter-spacing:.04em;line-height:1.7}
+.warnbar{display:flex;gap:8px;align-items:flex-start;margin-top:12px;padding:10px 11px;border-radius:12px;
+background:rgba(255,176,32,.12);border:1px solid rgba(255,176,32,.28);color:#FFD08A;font-size:12px;line-height:1.55;
+}
+.warnbar svg{width:14px;height:14px;flex-shrink:0;stroke:currentColor;fill:none;stroke-width:1.8;margin-top:2px}
+
+/* ---------- chips / rules ---------- */
+.chip{display:inline-block;padding:3px 8px;border-radius:8px;font-size:10.5px;font-weight:600;font-family:var(--mono);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:1px solid transparent}
+.chip.e{background:rgba(48,209,88,.16);color:#7BE8A4;border-color:rgba(48,209,88,.28)}
+.chip.m{background:rgba(64,200,224,.16);color:#7FDCEB;border-color:rgba(64,200,224,.28)}
+.chip.p{background:rgba(10,132,255,.18);color:#9CC7FF;border-color:rgba(10,132,255,.32)}
+.chip.h{background:rgba(191,90,242,.18);color:#D6A6FF;border-color:rgba(191,90,242,.32)}
+.chip.c{background:rgba(170,180,200,.14);color:#C2CADA;border-color:rgba(170,180,200,.24)}
+.chip.dyn{background:rgba(255,176,32,.16);color:#FFCE7A;border-color:rgba(255,176,32,.32)}
+.chip.dyn.dyn-multi{display:inline-flex;flex-direction:column;align-items:center;gap:1px;line-height:1.25;text-align:center;padding:4px 7px}
+.bar{display:flex;align-items:center;gap:8px;margin:4px 0 12px}
+.search{position:relative;flex:1;min-width:0}
+.search svg{position:absolute;left:12px;top:50%;transform:translateY(-50%);width:14px;height:14px;stroke:var(--dim);fill:none;stroke-width:1.9;stroke-linecap:round}
+#r-filter{width:100%;background:var(--glass);border:1px solid var(--stroke);border-radius:var(--r-pill);padding:10px 14px 10px 33px;font-size:13px;color:var(--fg);
+outline:none;font-family:inherit;transition:border-color .18s,background .18s}
+#r-filter::placeholder{color:var(--dim)}
+#r-filter:focus{border-color:rgba(10,132,255,.6);background:rgba(255,255,255,.10)}
+.btn{background:linear-gradient(180deg,#3AA0FF,#0A7CF0);color:#fff;padding:10px 16px;border-radius:var(--r-pill);font-size:13px;font-weight:650;
+box-shadow:0 1px 0 rgba(255,255,255,.35) inset,0 12px 24px -12px rgba(10,132,255,.85);transition:transform .18s var(--spring),filter .18s}
+.btn:active{transform:scale(.95);filter:brightness(.92)}
+.btn-outline{background:var(--glass);color:var(--sub);border:1px solid var(--stroke);padding:9px 16px;border-radius:var(--r-pill);font-size:14px;
+transition:transform .18s var(--spring)}
+.btn-outline:active{transform:scale(.95)}
+.fab{width:38px;height:38px;border-radius:50%;background:linear-gradient(180deg,#3AA0FF,#0A7CF0);color:#fff;display:grid;place-items:center;flex-shrink:0;
+box-shadow:0 1px 0 rgba(255,255,255,.35) inset,0 12px 24px -10px rgba(10,132,255,.9);transition:transform .2s var(--spring)}
+.fab svg{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round}
+.fab:active{transform:scale(.9)}
+.grp{background:linear-gradient(155deg,rgba(22,28,46,.78),rgba(14,19,34,.62));
+border:1px solid var(--stroke);border-radius:var(--r-card);margin-bottom:9px;overflow:hidden;transition:border-color .2s,transform .2s var(--spring);box-shadow:var(--glow)}
+.grp.open{border-color:rgba(10,132,255,.42)}
+.grp-head{display:flex;align-items:center;gap:9px;padding:14px 13px;cursor:pointer;user-select:none;-webkit-user-select:none;transition:background .18s}
+.grp-head:active{background:rgba(255,255,255,.05)}
+.chev{width:15px;height:15px;stroke:var(--dim);fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;transition:transform .28s var(--spring),stroke .2s;flex-shrink:0}
+.grp.open .chev{transform:rotate(90deg);stroke:var(--accent2)}
+.grp-name{flex:1;min-width:0;word-break:break-all;font-weight:600;font-size:13.5px;letter-spacing:.01em}
+.grp-count{font-size:10.5px;color:var(--sub);background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.10);border-radius:var(--r-pill);padding:2px 8px;flex-shrink:0;font-family:var(--mono)}
+.grp-body{height:0;overflow:hidden;transition:height .3s var(--spring)}
+.grp-inner{transform:translateY(-4px);opacity:.55;transition:transform .3s var(--spring),opacity .24s ease}
+.grp.open .grp-inner{transform:none;opacity:1}
+.rule-row{display:flex;align-items:center;gap:8px;padding:9px 13px;border-top:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.02)}
+.rule-name{flex:1;min-width:0;word-break:break-all;font-size:12.5px;font-family:var(--mono);color:#DCE4F5}
+.rule-sub{color:var(--dim);font-size:11.5px;font-family:var(--font)}
+.rule-add{display:flex;align-items:center;justify-content:center;gap:5px;margin:9px 13px 12px;padding:9px 0;border:1px dashed var(--stroke2);border-radius:12px;color:var(--sub);
+font-size:12.5px;width:calc(100% - 26px);background:rgba(255,255,255,.03);transition:border-color .18s,transform .18s var(--spring)}
+.rule-add:active{transform:scale(.98);border-color:var(--accent2)}
+.rule-add svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round}
+.icon-btn{padding:7px;border-radius:10px;color:var(--dim);display:flex;transition:transform .18s var(--spring),background .18s,color .18s}
+.icon-btn.danger{color:#FF9A93}
+.icon-btn:active{transform:scale(.88);background:rgba(255,255,255,.09)}
+.icon-btn svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.empty{padding:52px 24px;text-align:center;color:var(--dim);font-size:12.5px;line-height:1.9;font-family:var(--mono)}
+
+/* ---------- settings ---------- */
+.seg{display:flex;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.10);border-radius:13px;padding:3px;gap:3px}
+.seg button{flex:1;padding:9px 0;border-radius:10px;font-size:12.5px;color:var(--sub);transition:color .2s,background .2s,transform .2s var(--spring)}
+.seg button.on{background:linear-gradient(180deg,rgba(255,255,255,.18),rgba(255,255,255,.07));box-shadow:0 1px 0 rgba(255,255,255,.28) inset,0 8px 18px -12px rgba(0,0,0,.8);font-weight:650;color:#fff;border:1px solid rgba(255,255,255,.16)}
+.field{display:flex;gap:8px;align-items:center}
+.field input,.modal input{background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.11);border-radius:12px;padding:10px 12px;font-size:13px;outline:none;font-family:var(--mono);color:var(--fg);
+transition:border-color .18s,background .18s;min-width:0}
+.field input{flex:1}
+.field .btn{flex-shrink:0;padding:10px 14px;font-size:12.5px}
+.hint{font-size:11.5px;color:var(--dim);margin-top:9px;line-height:1.6;word-break:break-all;font-family:var(--mono)}
+.field input:focus,.modal input:focus{border-color:rgba(10,132,255,.6);background:rgba(255,255,255,.10)}
+.entry{display:flex;width:100%;align-items:center;gap:8px;padding:14px 0;font-size:13.5px;border-top:1px solid rgba(255,255,255,.08);transition:opacity .18s}
+.entry:first-of-type{border-top:none}
+.entry svg{margin-left:auto;width:14px;height:14px;stroke:var(--dim);fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.entry:active{opacity:.6}
+
+/* ---------- floating tab bar ---------- */
+.tabbar{display:flex;height:60px;flex-shrink:0;margin:0 12px calc(10px + env(safe-area-inset-bottom));border-radius:26px;padding:0 6px;
+border:1px solid var(--stroke);background:linear-gradient(180deg,rgba(255,255,255,.13),rgba(255,255,255,.05));
+backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur);
+box-shadow:0 1px 0 rgba(255,255,255,.3) inset,0 20px 40px -22px rgba(0,0,0,.85);transition:transform .42s var(--spring)}
+.tab{flex:1;position:relative;color:var(--dim);font-size:10.5px;letter-spacing:.06em;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+transition:color .2s;font-family:var(--mono);border-radius:20px}
+.tab svg{width:23px;height:23px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;transition:transform .3s var(--spring)}
+.tab.active{color:#fff}
+.tab.active:before{content:"";position:absolute;inset:6px 10px;border-radius:16px;background:rgba(255,255,255,.13);box-shadow:0 1px 0 rgba(255,255,255,.22) inset;z-index:-1}
+.tab.active svg{transform:translateY(-1px) scale(1.08);animation:tabPop .46s var(--spring);stroke:var(--accent2)}
+@keyframes tabPop{0%{transform:translateY(0) scale(1)}45%{transform:translateY(-4px) scale(1.22)}100%{transform:translateY(-1px) scale(1.08)}}
+
+/* ---------- sheet / toast ---------- */
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes sheetIn{from{transform:translateY(40px) scale(.98);opacity:.4}to{transform:none;opacity:1}}
+.modal-bg{position:fixed;inset:0;background:rgba(3,6,12,.55);backdrop-filter:blur(8px) saturate(120%);-webkit-backdrop-filter:blur(8px) saturate(120%);
+display:flex;align-items:flex-end;justify-content:center;z-index:100;animation:fadeIn .18s}
+.modal{background:linear-gradient(180deg,rgba(38,46,66,.92),rgba(18,23,36,.96));border:1px solid var(--stroke2);border-bottom:none;border-radius:30px 30px 0 0;
+padding:10px 18px calc(20px + env(safe-area-inset-bottom));width:100%;max-width:var(--max-w);max-height:90vh;overflow:auto;
+animation:sheetIn .46s var(--spring);scrollbar-width:none;box-shadow:0 -1px 0 rgba(255,255,255,.16) inset,0 -30px 60px -20px rgba(0,0,0,.8)}
+.modal::-webkit-scrollbar{display:none}
+.modal:before{content:"";display:block;width:36px;height:5px;border-radius:3px;background:rgba(255,255,255,.26);margin:2px auto 14px}
+#modal-rule .modal{touch-action:pan-y;will-change:transform}
+#modal-rule .modal.dragging{animation:none;transition:none}
+#modal-rule .modal.snapping{animation:none;transition:transform .32s var(--spring)}
+#modal-rule .modal.closing{animation:none;transition:transform .34s ease-in,opacity .3s ease}
+#modal-rule .modal.dragging:before,#modal-rule .modal.snapping:before{background:rgba(255,255,255,.4)}
+#modal-confirm .modal.closing{animation:none;transition:transform .24s ease-in,opacity .22s ease}
+.modal h3{font-size:16px;font-weight:650;margin-bottom:14px;letter-spacing:.01em}
+.modal input{width:100%;margin-bottom:10px}
+.modal input[readonly]{background:transparent;border-style:dashed;color:var(--sub)}
+.modal-actions{display:flex;gap:9px;margin-top:16px}
+.modal-actions button{flex:1;padding:12px 0;border-radius:var(--r-pill);font-size:14px}
+#mc-ok{background:linear-gradient(180deg,#FF6B60,#E5342A);color:#fff;box-shadow:0 1px 0 rgba(255,255,255,.3) inset,0 12px 24px -12px rgba(255,69,58,.8)}
+.core-chips{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
+.core-chips button{padding:7px 11px;border-radius:var(--r-chip);font-size:11px;font-family:var(--mono);background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.11);
+color:var(--sub);transition:all .2s var(--spring)}
+.core-chips button.on{background:rgba(10,132,255,.22);border-color:rgba(10,132,255,.6);color:#A9D1FF;font-weight:650;
+box-shadow:0 0 0 3px rgba(10,132,255,.16),0 1px 0 rgba(255,255,255,.2) inset}
+.sg-wrap{position:relative}
+.sg-box{position:absolute;left:0;right:0;top:calc(100% + 4px);background:rgba(30,38,56,.92);border:1px solid var(--stroke2);border-radius:14px;
+box-shadow:0 1px 0 rgba(255,255,255,.12) inset,0 24px 48px -24px rgba(0,0,0,.9);max-height:172px;overflow:auto;touch-action:pan-y;z-index:10;
+backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur);animation:fadeIn .12s}
+.sg-item{padding:10px 13px;font-size:12.5px;word-break:break-all;font-family:var(--mono);color:var(--sub)}
+.sg-item.hl,.sg-item:active{background:rgba(10,132,255,.18);color:var(--fg)}
+.tree-row{margin-bottom:14px}
+@keyframes rowUp{from{opacity:0;transform:translateY(12px) scale(.985)}to{opacity:1;transform:none}}
+.tree-row.row-in{animation:rowUp .42s var(--spring) both}
+.tree-row.branch{border-left:2px solid rgba(10,132,255,.34);padding-left:10px}
+.tr-head{display:flex;align-items:center;gap:6px;margin-bottom:7px}
+.tr-head input{flex:1;width:auto;min-width:0;margin-bottom:0}
+.tr-tag{font-size:11px;font-weight:650;color:var(--fg);letter-spacing:.04em}
+.tr-sub{font-size:10.5px;color:var(--dim);font-family:var(--mono)}
+.tr-head .tr-sub{margin-left:auto}
+.rr-dyn{margin-top:10px}
+.rr-dyn .seg{margin-bottom:10px}
+.dyn-tier{margin-bottom:9px}
+.dyn-tier .tr-tag{display:block;margin-bottom:5px}
+.dyn-tier .tr-sub{display:block;margin-top:3px}
+.dyn-tier-chips{margin-bottom:5px}
+.dyn-thr{display:flex;align-items:center;gap:8px}
+.dyn-thr .rr-thr{flex:1;width:auto;min-width:0;margin:0}
+#mr-rows .core-chips{margin-bottom:6px}
+#mr-rows .rr-custom{margin-bottom:0}
+#mr-addrow{width:100%;margin:0 0 4px}
+#toast{position:fixed;left:50%;bottom:92px;transform:translate(-50%,10px) scale(.96);background:rgba(34,42,60,.94);border:1px solid var(--stroke2);color:var(--fg);
+padding:10px 18px;border-radius:var(--r-pill);font-size:13px;z-index:200;opacity:0;transition:opacity .2s,transform .3s var(--spring);pointer-events:none;
+max-width:80vw;word-break:break-all;backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur);
+box-shadow:0 1px 0 rgba(255,255,255,.18) inset,0 18px 36px -18px rgba(0,0,0,.9)}
+#toast.show{opacity:1;transform:translate(-50%,0) scale(1)}
+
+/* ---------- about page (push) ---------- */
+.page{position:absolute;inset:0;background:rgba(9,13,24,.72);touch-action:pan-y;backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur);
+z-index:50;display:flex;flex-direction:column;transform:translateX(101%);transition:transform .46s var(--spring);pointer-events:none;box-shadow:-20px 0 48px -24px rgba(0,0,0,.9)}
+.page.show{transform:none;pointer-events:auto}
+.app.pushing .main,.app.pushing .tabbar{transform:translateX(-26%)}
+.navbar{display:flex;align-items:center;justify-content:center;position:relative;height:50px;flex-shrink:0;border-bottom:1px solid rgba(255,255,255,.10);
+background:rgba(255,255,255,.05)}
+.nav-title{font-size:15px;font-weight:650}
+.back{position:absolute;left:4px;top:0;height:100%;display:flex;align-items:center;gap:2px;color:var(--accent2);font-size:14px;padding:0 8px}
+.back svg{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.back:active{opacity:.6}
+.page .panel{flex:1;overflow:auto;padding-top:14px}
+.hero{text-align:center;padding:22px 16px 18px}
+.logo{width:70px;height:70px;border-radius:18px;background:linear-gradient(150deg,rgba(10,132,255,.55),rgba(191,90,242,.28));border:1px solid var(--stroke2);
+display:grid;place-items:center;margin:0 auto 14px;box-shadow:0 1px 0 rgba(255,255,255,.35) inset,0 20px 44px -22px rgba(10,132,255,.9)}
+.logo svg{width:34px;height:34px;stroke:#fff;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.hero .name{font-size:20px;font-weight:700;letter-spacing:.03em}
+.hero .ver{font-size:11.5px;color:var(--sub);margin-top:4px;font-family:var(--mono);letter-spacing:.08em}
+.text{font-size:12.5px;line-height:1.85;color:#BCC6D8;word-break:break-all}
+.text ol{padding-left:18px;display:grid;gap:5px}
+.row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 0;font-size:12.5px}
+.row+.row{border-top:1px solid rgba(255,255,255,.08)}
+.row .label{color:var(--dim);flex-shrink:0;font-family:var(--mono);font-size:11.5px}
+.row .value{font-weight:600;text-align:right;word-break:break-all}
+.mono{font-family:var(--mono);font-size:11.5px;font-weight:400}
+
+@media(orientation:landscape) and (min-width:640px){.app{max-width:var(--max-w)}}
+@media(prefers-reduced-motion:reduce){
+*,*:before,*:after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}
+body:before{animation:none}
+}
+</style>
+</head>
+<body>
+<div class="app">
+<header class="topbar">
+<div class="mark"><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></svg></div>
+<div class="brand">AppOpt<em>AFFINITY</em></div>
+<div class="live"><span id="s-mode">-</span></div>
+</header>
+<main class="main">
+
+<section id="tab-status" class="panel">
+<div class="hero-card">
+<div class="hero-row">
+<span class="eyebrow">运行状态</span>
+</div>
+<span class="upnum" id="s-up">-</span>
+<div class="hero-meta">已运行 · 版本 <b id="s-ver">-</b> · 检查间隔由设置页控制</div>
+</div>
+
+<div class="card" id="s-card-cores">
+<div class="card-head"><span class="card-title">核心拓扑</span><span class="card-note" id="s-cores-note">-</span></div>
+<div class="topo" id="topo"></div>
+<div class="topo-legend" id="topo-legend"></div>
+</div>
+
+<div class="card">
+<div class="card-head"><span class="card-title">规则与覆盖</span></div>
+<div class="grid3">
+<div class="stat"><div class="num" id="s-rules">0</div><div class="lbl">规则</div></div>
+<div class="stat"><div class="num" id="s-pkgs">0</div><div class="lbl">应用</div></div>
+<div class="stat"><div class="num" id="s-hit">0</div><div class="lbl">命中</div></div>
+</div>
+<div class="warnbar" id="s-pf" hidden><svg viewBox="0 0 24 24"><path d="M12 8v5M12 17h.01"/><path d="M10.3 3.6L2.6 17a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.6a2 2 0 0 0-3.4 0z"/></svg><span id="s-pf-t"></span></div>
+</div>
+
+<div class="card">
+<div class="card-head"><span class="card-title">进程与绑定</span></div>
+<div class="grid3">
+<div class="stat"><div class="num" id="s-threads">0</div><div class="lbl">绑定线程</div></div>
+<div class="stat"><div class="num" id="s-procs">0</div><div class="lbl">系统进程</div></div>
+<div class="stat"><div class="num" id="s-cores">0</div><div class="lbl">CPU 核心</div></div>
+</div>
+</div>
+<div class="foot">数据每 3 秒自动刷新 · 规则改动即时生效</div>
+</section>
+
+<section id="tab-rules" class="panel" hidden>
+<div class="bar">
+<div class="search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg><input id="r-filter" placeholder="共 0 个应用"></div>
+<button class="fab" id="r-add" title="添加应用"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+</div>
+<div id="r-list"></div>
+</section>
+
+<section id="tab-settings" class="panel" hidden>
+<div class="card">
+<div class="card-head"><span class="card-title">工作模式</span></div>
+<div class="seg" id="seg-mode">
+<button data-mode="0">自动</button>
+<button data-mode="1">eBPF</button>
+<button data-mode="2">Proc</button>
+</div>
+<div class="hint" id="c-mode-active">当前生效: -</div>
+<div class="warnbar" id="c-ebpf-hint" hidden style="margin-top:9px"><svg viewBox="0 0 24 24"><path d="M12 8v5M12 17h.01"/><path d="M10.3 3.6L2.6 17a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.6a2 2 0 0 0-3.4 0z"/></svg><span>此设备内核不支持 eBPF，强制 eBPF 时将保持 Proc 轮询</span></div>
+</div>
+<div class="card">
+<div class="card-head"><span class="card-title">扫描参数</span></div>
+<div class="field"><input id="c-interval" type="number" min="1" max="3600"><button class="btn" id="c-interval-save">保存</button></div>
+<div class="hint">检查间隔（秒），影响 /proc 扫描与配置轮询频率</div>
+</div>
+<div class="card">
+<div class="card-head"><span class="card-title">CPUSET</span></div>
+<div class="field"><input id="c-cpuset"><button class="btn" id="c-cpuset-save">保存</button></div>
+<div class="hint">BASE_CPUSET 目录名（当前 <span id="c-cpuset-on">未知</span>），修改后规则将重建亲和性目录并重新加载</div>
+</div>
+<div class="card">
+<div class="card-head"><span class="card-title">规则配置文件</span></div>
+<div class="field"><input id="c-file"><button class="btn" id="c-file-save">保存</button></div>
+<div class="hint">修改后立即迁移监听并加载新文件，原文件保留</div>
+</div>
+<div class="card">
+<div class="card-head"><span class="card-title">Web 面板</span></div>
+<div class="field"><input id="c-port" type="number" min="1024" max="65535"><button class="btn" id="c-port-save">保存</button></div>
+<div class="hint">仅监听 127.0.0.1。保存后立即切换端口并跳转到新地址；新端口被占用时保持原端口</div>
+</div>
+<div class="card">
+<button class="entry" id="c-about">关于 AppOpt<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+</div>
+</section>
+
+</main>
+<nav class="tabbar">
+<button class="tab active" data-tab="status"><svg viewBox="0 0 24 24"><path d="M4 16a8 8 0 0 1 16 0"/><path d="M12 16L16 12"/><circle cx="12" cy="16" r="1.2" fill="currentColor" stroke="none"/><path d="M6 20h12"/></svg>状态</button>
+<button class="tab" data-tab="rules"><svg viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="4" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1" fill="currentColor" stroke="none"/></svg>规则</button>
+<button class="tab" data-tab="settings"><svg viewBox="0 0 24 24"><path d="M5 21V9M12 21V3M19 21v-8"/><circle cx="5" cy="6" r="2"/><circle cx="12" cy="9" r="2"/><circle cx="19" cy="10" r="2"/></svg>设置</button>
+</nav>
+
+<section id="page-about" class="page">
+<div class="navbar">
+<button class="back" id="about-back"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>设置</button>
+<span class="nav-title">关于</span>
+</div>
+<div class="panel">
+<div class="card hero">
+<div class="logo"><svg viewBox="0 0 24 24"><path d="M9 3v2M15 3v2M9 19v2M15 19v2M3 9h2M3 15h2M19 9h2M19 15h2"/><rect x="7" y="7" width="10" height="10" rx="2"/></svg></div>
+<div class="name">AppOpt</div>
+<div class="ver" id="a-ver">v?</div>
+</div>
+<div class="card">
+<div class="card-head"><span class="card-title">简介</span></div>
+<p class="text">AppOptR 是一款 Android 应用线程 CPU 亲和性管理工具，基于规则配置文件，将指定应用的进程与线程绑定到指定的 CPU 核心簇，支持 eBPF 事件驱动与 /proc 轮询双模式，配置热加载及时生效，另支持按负载动态调度的 elect/load 规则。</p>
+</div>
+<div class="card">
+<div class="card-head"><span class="card-title">使用说明</span></div>
+<div class="text"><ol>
+<li>规则页点击「＋」，输入应用包名，可同时配置包级默认（可选）与多条线程规则后一次保存</li>
+<li>设置页可切换 eBPF / Proc 工作模式、cpuset 目录名、检查间隔与配置文件路径</li>
+<li>配置文件也可直接手工编辑，保存后自动热加载</li>
+<li>更多规则编写说明参考官网文档和本仓库 README.md</li>
+</ol></div>
+</div>
+<div class="card">
+<div class="card-head"><span class="card-title">作者与链接</span></div>
+<div class="row"><span class="label">原作者</span><span class="value">Suto</span></div>
+<div class="row"><span class="label">二改作者</span><span class="value">未央</span></div>
+<div class="row"><span class="label">官网</span><span class="value mono"><a href="http://appopt.suto.top" target="_blank" rel="noopener">appopt.suto.top</a></span></div>
+<div class="row"><span class="label">GITHUB</span><span class="value mono"><a href="https://github.com/BingYinBest/AppOptR" target="_blank" rel="noopener">BingYinBest/AppOptR</a></span></div>
+</div>
+</div>
+</section>
+
+</div>
+
+<div id="modal-rule" class="modal-bg" hidden>
+<div class="modal">
+<h3 id="mr-title">添加应用</h3>
+<div class="sg-wrap"><input id="mr-pkg" placeholder="输入应用包名"><div class="sg-box" id="sg-pkg" hidden></div></div>
+<div id="mr-rows"></div>
+<button class="rule-add" id="mr-addrow" hidden>＋ 线程规则</button>
+<div class="modal-actions">
+<button class="btn-outline" id="mr-cancel">取消</button>
+<button class="btn" id="mr-save">保存</button>
+</div>
+</div>
+</div>
+
+<div id="modal-confirm" class="modal-bg" hidden>
+<div class="modal">
+<h3 id="mc-title">删除规则</h3>
+<p class="hint" id="mc-msg" style="text-align:center;font-size:12.5px;color:var(--fg);font-family:var(--font)"></p>
+<div class="modal-actions">
+<button class="btn-outline" id="mc-cancel">取消</button>
+<button class="btn" id="mc-ok">删除</button>
+</div>
+</div>
+</div>
+
+<div id="toast"></div>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function fmtUp(s){s=+s||0;const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d>0?d+'天'+h+'小时':h>0?h+'小时'+m+'分':m>0?m+'分':'刚刚'}
+const modeLabel=m=>m==='ebpf'?'eBPF 事件驱动':'Proc 轮询';
+const modeShort=m=>m==='ebpf'?'eBPF':'Proc';
+async function api(path,body){
+  const opts=body!==undefined?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{};
+  const r=await fetch(path,opts);
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(d.err||('HTTP '+r.status));
+  return d;
+}
+function toast(m){const t=$('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._tm);t._tm=setTimeout(()=>t.classList.remove('show'),1600)}
+
+let activeTab='status',statTimer=null;
+let tabStack=['status'];
+let tabAnimSeq=0;
+let ruleSheetReset=()=>{},ruleSheetClose=()=>{},ruleSheetHistory=false,ruleSheetClosing=false;
+let confirmClosing=false,confirmHistory=false,confirmSeq=0,confirmTimer=0;
+function tabSideEffects(t){
+  if(t==='status')startStat();else stopStat();
+  if(t==='rules')loadRules();
+  if(t==='settings')loadCfg();
+}
+function setTabActive(t){
+  document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.tab===t));
+}
+function switchTab(t,dir){
+  if(t===activeTab||!$('tab-'+t))return;
+  const from=$('tab-'+activeTab),to=$('tab-'+t);
+  const seq=++tabAnimSeq;
+  ['status','rules','settings'].forEach(n=>{
+    const el=$('tab-'+n);
+    if(el!==from&&el!==to){el.hidden=true;resetPanelStyles(el)}
+  });
+  activeTab=t;setTabActive(t);tabSideEffects(t);
+  if(dir==='none'){
+    ['status','rules','settings'].forEach(n=>{const el=$('tab-'+n);el.hidden=n!==t;if(n!==t)resetPanelStyles(el)});
+    resetPanelStyles(to);
+    return;
+  }
+  to.hidden=false;
+  to.style.transition='none';
+  to.style.transform=dir==='back'?'translateX(-26%) scale(.97)':'translateX(100%)';
+  to.style.opacity=dir==='back'?'.55':'1';
+  from.style.transition='none';from.style.transform='none';from.style.opacity='1';
+  void to.offsetWidth;
+  const ease='transform .42s var(--spring), opacity .3s ease';
+  to.style.transition=ease;from.style.transition=ease;
+  to.style.transform='none';to.style.opacity='1';
+  from.style.transform=dir==='back'?'translateX(100%)':'translateX(-26%)';
+  from.style.opacity='0';
+  setTimeout(()=>{
+    if(seq!==tabAnimSeq)return;
+    from.hidden=true;
+    resetPanelStyles(from);resetPanelStyles(to);
+  },460);
+}
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
+  const t=b.dataset.tab;
+  if(t===activeTab)return;
+  tabStack.push(t);
+  try{history.pushState({tabStack:tabStack.slice()},'','#'+t)}catch(e){}
+  switchTab(t,'forward');
+});
+try{history.replaceState({tabStack:['status']},'',location.pathname+location.search)}catch(e){}
+window.addEventListener('popstate',e=>{
+  if(!$('modal-confirm').hidden||confirmClosing){
+    confirmHistory=false;
+    closeConfirm(false);
+    return;
+  }
+  if(!$('modal-rule').hidden||ruleSheetClosing){
+    ruleSheetHistory=false;
+    ruleSheetClose(false);
+    return;
+  }
+  if($('page-about').classList.contains('show')&&!(e.state&&e.state.about)){closeAbout(false);return}
+  const st=e.state&&Array.isArray(e.state.tabStack)?e.state.tabStack.slice():['status'];
+  tabStack=st;
+  const target=tabStack[tabStack.length-1];
+  if(target!==activeTab)switchTab(target,'back');
+});
+
+function startStat(){stopStat();refreshStat();statTimer=setInterval(refreshStat,3000)}
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden&&activeTab==='status')refreshStat();
+});
+function stopStat(){if(statTimer){clearInterval(statTimer);statTimer=null}}
+function setNum(el,v){
+  const s=String(v);
+  if(el.dataset.v===s)return;
+  el.dataset.v=s;
+  if(el.childElementCount!==s.length){
+    el.innerHTML=colsHtml(s);
+    el.classList.remove('num-in');void el.offsetWidth;el.classList.add('num-in');
+    return;
+  }
+  [...el.children].forEach((c,i)=>{
+    const cur=+(c.dataset.cur||0),d=+s[i];
+    c.dataset.cur=d;
+    if(d===cur)return;
+    if(d<cur){
+      c.style.transition='none';
+      c.style.setProperty('--d',cur+10);
+      void c.offsetWidth;
+      c.style.transition='';
+      c.style.setProperty('--d',d+10);
+      const token=c._t=(c._t||0)+1;
+      clearTimeout(c._tm);
+      c._tm=setTimeout(()=>{
+        if(c._t!==token)return;
+        c.style.transition='none';
+        c.style.setProperty('--d',d);
+        void c.offsetWidth;
+        c.style.transition='';
+      },560);
+    }else{
+      c.style.setProperty('--d',d);
+    }
+  });
+}
+const DIG_ROWS=Array.from({length:20},(_,i)=>`<i>${i%10}</i>`).join('');
+const colsHtml=s=>[...s].map(d=>`<span class="dig" style="--d:${d}" data-cur="${d}">${DIG_ROWS}</span>`).join('');
+
+const TIERS=[{k:'e-core',cn:'小核',id:'e_core',cls:'e'},{k:'m-core',cn:'中核',id:'m_core',cls:'m'},{k:'p-core',cn:'中核',id:'p_core',cls:'p'},{k:'hp-core',cn:'大核',id:'hp_core',cls:'h'}];
+function coreCount(spec,total){
+  if(!spec)return 0;
+  if(spec==='all-core')return +total||0;
+  let n=0;
+  String(spec).split(',').forEach(p=>{
+    p=p.trim();
+    if(!p)return;
+    const m=p.match(/^(\d+)-(\d+)$/);
+    if(m)n+=Math.max(0,+m[2]-+m[1]+1);
+    else if(/^\d+$/.test(p))n+=1;
+  });
+  return n;
+}
+let topoSig='';
+function renderTopo(d){
+  const box=$('topo'),legend=$('topo-legend');
+  const vis=semanticVisible();
+  const sig=vis.join('|')+'#'+d.cores+'#'+d.all_core+'#'+vis.map(k=>{const t=TIERS.find(x=>x.k===k);return (t?d[t.id]:'')||''}).join('|');
+  if(sig===topoSig)return;
+  topoSig=sig;
+  $('s-card-cores').hidden=false;
+  [...box.children].forEach(c=>c.remove());
+  [...legend.children].forEach(c=>c.remove());
+  if(!vis.length){
+    const total=+d.cores||0,all=d.all_core||'';
+    const n=coreCount(all,total)||total||1;
+    const seg=document.createElement('div');
+    seg.className='ts c';
+    seg.style.flexGrow=n;
+    seg.innerHTML=`<i>${n}×全部核心</i>`;
+    seg.title=`${all||'全部'} · ${n} 核`;
+    box.appendChild(seg);
+    const lg=document.createElement('span');
+    lg.className='c';
+    lg.textContent=`全部 ${all||n+' 核'}`;
+    legend.appendChild(lg);
+    $('s-cores-note').textContent=`${total||'?'} 核 · 未分档`;
+    return;
+  }
+  const total=+d.cores||0;
+  vis.forEach(k=>{
+    const t=TIERS.find(x=>x.k===k);
+    const spec=d[t.id]||'';
+    const n=coreCount(spec,total)||1;
+    const seg=document.createElement('div');
+    seg.className='ts '+t.cls;
+    seg.style.flexGrow=n;
+    seg.innerHTML=`<i>${n}×${t.cn}</i>`;
+    seg.title=`${spec} · ${n} 核`;
+    box.appendChild(seg);
+    const lg=document.createElement('span');
+    lg.className=t.cls;
+    lg.textContent=`${spec} ${t.cn}`;
+    legend.appendChild(lg);
+  });
+  const all=d.all_core||'';
+    if(all){
+    const lg=document.createElement('span');
+    lg.className='c';
+    lg.textContent=`全部 ${all}`;
+    legend.appendChild(lg);
+  }
+  $('s-cores-note').textContent=`${total||'?'} 核 · ${vis.length} 档`;
+}
+
+async function refreshStat(){
+  if(document.hidden)return;
+  try{
+    const d=await api('/api/status');
+    const mb=$('s-mode');
+    mb.textContent=modeShort(d.mode);
+    mb.className='badge '+(d.mode==='ebpf'?'ebpf':'proc');
+    mb.title=modeLabel(d.mode);
+    $('s-up').textContent=fmtUp(d.uptime);
+    $('s-ver').textContent='v'+(d.version||'?');
+    const pf=+d.parse_fail||0;
+    setNum($('s-rules'),d.rules);
+    setNum($('s-pkgs'),d.pkgs);
+    $('s-pf').hidden=!pf;
+    if(pf)$('s-pf-t').textContent=pf+' 行规则因格式无效被跳过，请检查配置文件';
+    setNum($('s-hit'),d.hit_pkgs);
+    setNum($('s-threads'),d.threads);
+    setNum($('s-procs'),d.total_procs);
+    setNum($('s-cores'),d.cores);
+    topoCores=topoOf(d);
+    renderTopo(d);
+  }catch(e){}
+}
+
+let rulesData=[];
+function chipCls(s){return /^(elect|load)\(/.test(s)?'dyn':s==='e-core'?'e':s==='m-core'?'m':s==='p-core'?'p':s==='hp-core'?'h':'c'}
+function chipHtml(s){const m=s.match(/^(elect|load)\((.+)\)$/);if(m){const t=m[2].split('|').map(x=>x.trim());const tiers=t.slice(0,2).join(' ');const head=m[1]==='load'&&t[2]?`load ${esc(t[2])}%`:'elect';return `<span class="chip dyn dyn-multi"><span>${head}</span><span>${esc(tiers)}</span></span>`}return `<span class="chip ${chipCls(s)}">${esc(s)}</span>`}
+function tierOfSpec(s){if(!s)return 4;const all=[...s.matchAll(/(hp-core|p-core|m-core|e-core)/g)].map(m=>m[1]);if(!all.length)return 4;return all.some(x=>x==='hp-core')?0:all.some(x=>x==='p-core')?1:all.some(x=>x==='m-core')?2:3}
+const ICO_EDIT='<svg viewBox="0 0 24 24"><path d="M17 3l4 4L8 20l-5 1 1-5z"/></svg>';
+const ICO_TRASH='<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-8 0l1 13h8l1-13"/></svg>';
+async function loadRules(){
+  fetchTopo();
+  try{
+    const d=await api('/api/rules');
+    rulesData=d.rules||[];
+    renderRules(true);
+  }catch(e){toast(e.message)}
+}
+function grpInner(g,gi){
+  const items=g.items.map((it,ii)=>[ii,it]).sort((a,b)=>{
+    const ai=a[1],bi=b[1];
+    if(!ai.thread)return -1;
+    if(!bi.thread)return 1;
+    if(!!ai.dyn!==!!bi.dyn)return ai.dyn?1:-1;
+    const ta=tierOfSpec(ai.spec),tb=tierOfSpec(bi.spec);
+    if(ta!==tb)return ta-tb;
+    return ai.thread.localeCompare(bi.thread);
+  });
+  return `
+<div class="grp-head">
+<svg class="chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
+<span class="grp-name">${esc(g.pkg)}</span>
+<span class="grp-count">${g.items.length}</span>
+<button class="icon-btn" data-editapp="${gi}" title="编辑应用">${ICO_EDIT}</button>
+<button class="icon-btn danger" data-delpkg="${gi}" title="删除该应用全部规则">${ICO_TRASH}</button>
+</div>
+<div class="grp-body"><div class="grp-inner">
+${items.map(([ii,it])=>it.dyn
+  ?`<div class="rule-row">
+<span class="rule-name">${esc(it.thread)}</span>
+${chipHtml(it.spec)}
+<button class="icon-btn" data-edit="${gi}:${ii}" title="编辑动态规则">${ICO_EDIT}</button>
+<button class="icon-btn danger" data-del="${gi}:${ii}" title="删除">${ICO_TRASH}</button>
+</div>`
+  :`<div class="rule-row">
+<span class="rule-name">${it.thread?esc(it.thread):'<span class="rule-sub">包级默认</span>'}</span>
+${chipHtml(it.spec)}
+<button class="icon-btn" data-edit="${gi}:${ii}" title="${it.thread?'编辑线程规则':'编辑包级规则'}">${ICO_EDIT}</button>
+<button class="icon-btn danger" data-del="${gi}:${ii}" title="删除">${ICO_TRASH}</button>
+</div>`).join('')}
+<button class="rule-add" data-addthread="${gi}"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>添加线程规则</button>
+</div></div>`;
+}
+function setGroupOpen(grp,open){
+  const body=grp.querySelector('.grp-body');
+  grp.classList.toggle('open',open);
+  if(open){
+    body.style.height=body.scrollHeight+'px';
+    const done=e=>{
+      if(e.target!==body||e.propertyName!=='height')return;
+      body.style.height='auto';
+      body.removeEventListener('transitionend',done);
+    };
+    body.addEventListener('transitionend',done);
+  }else{
+    body.style.height=body.scrollHeight+'px';
+    void body.offsetHeight;
+    body.style.height='0px';
+  }
+}
+function ruleHit(g,f){
+  if(!f)return true;
+  if(g.pkg.toLowerCase().includes(f))return true;
+  return g.items.some(it=>it.thread&&it.thread.toLowerCase().includes(f));
+}
+let rulesRendered=false;
+function renderRules(full){
+  const f=$('r-filter').value.trim().toLowerCase();
+  const idx=rulesData.map((g,gi)=>gi).filter(gi=>ruleHit(rulesData[gi],f));
+  $('r-filter').placeholder=f?`匹配 ${idx.length}/${rulesData.length} 个应用`:`共 ${rulesData.length} 个应用`;
+  const box=$('r-list');
+  const shown=new Set(idx);
+  if(full||!rulesRendered){
+    const live=new Map([...box.querySelectorAll('.grp')].map(el=>[el.dataset.pkg,el]));
+    const pkgs=new Set(rulesData.map(g=>g.pkg));
+    let ref=box.firstChild;
+    rulesData.forEach((g,gi)=>{
+      let el=live.get(g.pkg);
+      if(!el){el=document.createElement('div');el.className='grp';el.dataset.pkg=g.pkg}
+      const wasOpen=el.classList.contains('open');
+      el.innerHTML=grpInner(g,gi);
+      if(wasOpen){el.querySelector('.grp-body').style.height='auto'}
+      if(el!==ref)box.insertBefore(el,ref);
+      ref=el.nextSibling;
+    });
+    live.forEach((el,p)=>{if(!pkgs.has(p))el.remove()});
+    rulesRendered=true;
+  }
+  [...box.children].forEach((el,i)=>{if(el.classList.contains('grp'))el.hidden=!shown.has(i)});
+  let tip=box.querySelector('.empty');
+  if(!idx.length){
+    if(!tip){tip=document.createElement('div');tip.className='empty';box.appendChild(tip)}
+    tip.innerHTML=f?'无匹配应用':'暂无规则<br>点击右上角「＋」创建第一条规则';
+  }else tip?.remove();
+}
+$('r-filter').addEventListener('input',()=>renderRules());
+$('r-list').addEventListener('click',e=>{
+  const ea=e.target.closest('[data-editapp]');
+  if(ea){openRuleModal('edit-app',+ea.dataset.editapp);return}
+  const dp=e.target.closest('[data-delpkg]');
+  if(dp){delPkg(+dp.dataset.delpkg);return}
+  const at=e.target.closest('[data-addthread]');
+  if(at){openRuleModal('add-thread',+at.dataset.addthread);return}
+  const head=e.target.closest('.grp-head');
+  if(head){setGroupOpen(head.parentElement,!head.parentElement.classList.contains('open'));return}
+  const eb=e.target.closest('[data-edit]');
+  if(eb){
+    const [gi,ii]=eb.dataset.edit.split(':').map(Number);
+    openRuleModal(rulesData[gi].items[ii].thread?'edit-thread':'edit-pkg',gi,ii);
+    return;
+  }
+  const db=e.target.closest('[data-del]');
+  if(db){const [gi,ii]=db.dataset.del.split(':').map(Number);delRule(gi,ii)}
+});
+
+const CORE_KEYS=['e-core','m-core','p-core','hp-core'];
+let topoCores=null;
+const topoOf=d=>({e:d.e_core||'',m:d.m_core||'',p:d.p_core||'',hp:d.hp_core||''});
+async function fetchTopo(){
+  if(!topoCores)try{const d=await api('/api/status');topoCores=topoOf(d)}catch(e){}
+}
+const CORE_FIELD={'e-core':'e','m-core':'m','p-core':'p','hp-core':'hp'};
+function semanticVisible(){
+  if(!topoCores)return CORE_KEYS;
+  const t=topoCores;
+  return CORE_KEYS.filter(k=>{
+    const v=t[CORE_FIELD[k]];
+    if(!v)return false;
+    if(k==='p-core'||k==='m-core')return v!==t.e&&v!==t.hp;
+    return true;
+  });
+}
+const DYN_RE=/^(elect|load)\((.+)\)$/;
+function parseSpec(spec){
+  const m=spec.match(DYN_RE);
+  if(m){
+    const t=m[2].split('|').map(s=>s.trim());
+    if(m[1]==='elect'&&t.length===2)return{dyn:true,dynMode:'elect',dynT:t,dynCustom:t.map(v=>!!v&&!DYN_KEYS.includes(v))};
+    if(m[1]==='load'&&t.length===3)return{dyn:true,dynMode:'load',dynT:t.slice(0,2),dynThr:+t[2]||50,dynCustom:t.slice(0,2).map(v=>!!v&&!DYN_KEYS.includes(v))};
+  }
+  const vis=semanticVisible();
+  const parts=spec.split(',').map(s=>s.trim()).filter(Boolean);
+  const sem=parts.filter(p=>CORE_KEYS.includes(p)&&vis.includes(p));
+  if(spec==='all-core')return{sem:vis,all:true};
+  if(parts.length&&sem.length===parts.length)return{sem};
+  return{custom:true,customVal:spec};
+}
+const mkRow=o=>({thread:'',sem:[],all:false,custom:false,customVal:'',dyn:false,dynMode:'elect',dynT:['',''],dynCustom:[false,false],dynThr:50,...o});
+function specOf(r){
+  if(r.dyn){
+    const t=r.dynT.map(s=>s.trim());
+    return r.dynMode==='elect'?`elect(${t[0]} | ${t[1]})`:`load(${t[0]} | ${t[1]} | ${+r.dynThr||50})`;
+  }
+  if(r.custom)return r.customVal.trim();
+  if(r.all)return 'all-core';
+  return r.sem.join(',');
+}
+const CHIP_HTML=[['hp-core','hp-core 大核'],['p-core','p-core 中核'],['m-core','m-core 中频'],['e-core','e-core 小核'],['all-core','all-core 全部'],['自定义','自定义']]
+  .map(([c,t])=>`<button data-core="${c}" title="${t}">${c}</button>`).join('');
+const DYN_CHIP_HTML=[['hp-core','hp-core 大核'],['p-core','p-core 中核'],['m-core','m-core 中频'],['e-core','e-core 小核'],['all-core','all-core 全部'],['自定义','自定义 CPU 范围或档位名']]
+  .map(([c,t])=>`<button data-core="${c}" title="${t}">${c}</button>`).join('');
+const DYN_KEYS=['hp-core','p-core','m-core','e-core','all-core'];
+const isDynSemantic=v=>DYN_KEYS.includes(v);
+function applyRowTopo(el){
+  const vis=semanticVisible();
+  el.querySelectorAll('.core-chips:not(.dyn-tier-chips) button').forEach(b=>{
+    const c=b.dataset.core;
+    b.hidden=(c==='自定义'||c==='all-core'||c==='动态')?false:!vis.includes(c);
+  });
+}
+function updateRowChips(el,r){
+  const vis=semanticVisible();
+  el.querySelectorAll('.core-chips:not(.dyn-tier-chips) button').forEach(b=>{
+    const c=b.dataset.core;
+    if(c==='动态'){b.hidden=false;b.classList.toggle('on',r.dyn);return}
+    if(r.dyn){b.hidden=true;return}
+    b.hidden=(c==='自定义'||c==='all-core')?false:!vis.includes(c);
+    b.classList.toggle('on',c==='自定义'?r.custom:c==='all-core'?r.all:(!r.custom&&!r.all&&r.sem.includes(c)));
+  });
+  el.querySelector('.rr-custom').hidden=r.dyn||!r.custom;
+  updateRowDyn(el,r);
+}
+function updateRowDyn(el,r){
+  el.querySelector('.rr-dyn').hidden=!r.dyn;
+  if(!r.dyn)return;
+  el.querySelectorAll('.dyn-seg button').forEach(b=>b.classList.toggle('on',b.dataset.dm===r.dynMode));
+  el.querySelector('.dyn-thr').hidden=r.dynMode!=='load';
+  r.dynT.forEach((v,i)=>{
+    const tierEl=el.querySelector(`.dyn-tier-chips[data-ti="${i}"]`);
+    const input=el.querySelector(`.dyn-tier-input[data-ti="${i}"]`);
+    input.value=v;
+    const custom=!!(r.dynCustom[i]||(v&&!isDynSemantic(v)));
+    input.hidden=!custom;
+    tierEl.querySelectorAll('button').forEach(b=>{
+      b.hidden=CORE_KEYS.includes(b.dataset.core)&&!semanticVisible().includes(b.dataset.core);
+      b.classList.toggle('on',b.dataset.core==='自定义'?custom:b.dataset.core===v);
+    });
+  });
+  el.querySelector('.rr-thr').value=r.dynThr;
+}
+let mrRows=[];
+function rowHtml(r,i){
+  const tree=isTree();
+  return `
+<div class="tree-row${r.pkgRow?'':' branch'}" data-ri="${i}">
+${r.pkgRow
+  ?'<div class="tr-head"><span class="tr-tag">包级默认</span><span class="tr-sub">全部线程 · 可选</span></div>'
+  :`<div class="tr-head sg-wrap"><input class="rr-thread" placeholder="输入线程名" value="${esc(r.thread)}"><div class="sg-box" hidden></div>${tree?`<button class="icon-btn danger rr-del" title="删除该行">${ICO_TRASH}</button>`:''}</div>`}
+<div class="core-chips">${CHIP_HTML}${r.pkgRow?'':`<button data-core="动态" title="动态规则：按负载自动选档" style="color:var(--amber);background:rgba(255,176,32,.10);border-color:rgba(255,176,32,.32)">动态</button>`}</div>
+<input class="rr-custom" placeholder="CPU 范围，如 0-3,6" value="${esc(r.customVal||'')}" hidden>
+<div class="rr-dyn" hidden>
+<div class="seg dyn-seg">
+<button data-dm="elect">elect · 组内选举</button>
+<button data-dm="load">load · 负载阈值</button>
+</div>
+<div class="dyn-tier"><span class="tr-tag">第一档</span><div class="core-chips dyn-tier-chips" data-ti="0">${DYN_CHIP_HTML}</div><input class="dyn-tier-input" data-ti="0" placeholder="如 6-7 或 hp-core"><span class="tr-sub">elect：负载最高线程 · load：超过阈值时</span></div>
+<div class="dyn-tier"><span class="tr-tag">第二档</span><div class="core-chips dyn-tier-chips" data-ti="1">${DYN_CHIP_HTML}</div><input class="dyn-tier-input" data-ti="1" placeholder="如 0-5 或 e-core"><span class="tr-sub">elect：其余线程 · load：未超过阈值时</span></div>
+<div class="field dyn-thr"><span class="tr-tag">阈值 %</span><input class="rr-thr" type="number" min="1" max="100"><span class="tr-sub">负载超过时绑第一档</span></div>
+</div>
+</div>`;
+}
+function setupRow(el,r,i){
+  applyRowTopo(el);updateRowChips(el,r);
+  if(!r.pkgRow)suggest_bind(el.querySelector('.rr-thread'),el.querySelector('.sg-box'),{thread:true,onpick:v=>r.thread=v.trim()});
+}
+function renderRows(anim){
+  const box=$('mr-rows');
+  if(anim==='last'&&mrRows.length){
+    const i=mrRows.length-1;
+    const holder=document.createElement('div');
+    holder.innerHTML=rowHtml(mrRows[i],i);
+    const el=holder.firstElementChild;
+    el.classList.add('row-in');
+    box.appendChild(el);
+    setupRow(el,mrRows[i],i);
+    return;
+  }
+  box.innerHTML=mrRows.map((r,i)=>rowHtml(r,i)).join('');
+  if(anim==='all')mrRows.forEach((r,i)=>{const el=box.children[i];el.classList.add('row-in');el.style.animationDelay=(i*35)+'ms'});
+  mrRows.forEach((r,i)=>setupRow(box.children[i],r,i));
+}
+$('mr-rows').addEventListener('click',e=>{
+  const del=e.target.closest('.rr-del');
+  if(del){
+    const el=del.closest('[data-ri]'),i=+el.dataset.ri;
+    mrRows.splice(i,1);el.remove();
+    [...$('mr-rows').children].forEach((c,j)=>c.dataset.ri=j);
+    return;
+  }
+  const dm=e.target.closest('.dyn-seg button');
+  if(dm){
+    const el=dm.closest('[data-ri]'),r=mrRows[+el.dataset.ri];
+    r.dynMode=dm.dataset.dm;
+    updateRowDyn(el,r);
+    return;
+  }
+  const tc=e.target.closest('.dyn-tier-chips button');
+  if(tc){
+    const chipsEl=tc.closest('.dyn-tier-chips');
+    const el=chipsEl.closest('[data-ri]'),r=mrRows[+el.dataset.ri],ti=+chipsEl.dataset.ti;
+    if(tc.dataset.core==='自定义'){if(isDynSemantic(r.dynT[ti]))r.dynT[ti]='';r.dynCustom[ti]=true}
+    else{r.dynT[ti]=r.dynT[ti]===tc.dataset.core?'':tc.dataset.core;r.dynCustom[ti]=false}
+    updateRowDyn(el,r);
+    return;
+  }
+  const b=e.target.closest('.core-chips button');
+  if(!b)return;
+  const el=b.closest('[data-ri]'),r=mrRows[+el.dataset.ri],c=b.dataset.core;
+  if(c==='动态'){
+    r.dyn=!r.dyn;
+    if(r.dyn&&!r.dynT[0].trim()){const v=r.custom?r.customVal.trim():r.all?'all-core':r.sem.join(',');if(v)r.dynT[0]=v}
+    updateRowChips(el,r);
+    return;
+  }
+  if(c==='自定义'){r.custom=!r.custom;r.all=false}
+  else if(c==='all-core'){r.all=!r.all;r.custom=false;if(!r.all)r.sem=[]}
+  else{
+    const base=r.custom||r.all?[]:r.sem;
+    r.sem=base.includes(c)?base.filter(x=>x!==c):[...base,c];
+    r.custom=false;r.all=false;
+  }
+  updateRowChips(el,r);
+});
+$('mr-rows').addEventListener('input',e=>{
+  const r=mrRows[+e.target.closest('[data-ri]')?.dataset.ri];
+  if(!r)return;
+  if(e.target.classList.contains('rr-thread'))r.thread=e.target.value.trim();
+  if(e.target.classList.contains('rr-custom'))r.customVal=e.target.value;
+  if(e.target.classList.contains('dyn-tier-input'))r.dynT[+e.target.dataset.ti]=e.target.value;
+  if(e.target.classList.contains('rr-thr'))r.dynThr=e.target.value;
+});
+$('mr-addrow').onclick=()=>{mrRows.push(mkRow({}));renderRows('last');const m=$('mr-addrow').closest('.modal');m.scrollTo({top:m.scrollHeight,behavior:'smooth'})};
+let mrMode='add-pkg',mrOldThread='',mrOldPkg='',mrOldThreads=new Set(),mrHadPkgRule=false;
+const isTree=()=>mrMode==='add-pkg'||mrMode==='edit-app';
+async function openRuleModal(mode,gi,ii){
+  await fetchTopo();
+  mrMode=mode;mrOldThread='';
+  const pkg=$('mr-pkg');
+  const tree=isTree();
+  pkg.readOnly=!tree;
+  pkg.value=mode==='add-pkg'?'':rulesData[gi].pkg;
+  $('mr-addrow').hidden=!tree;
+  if(mode==='add-pkg'){
+    $('mr-title').textContent='添加应用';
+    mrRows=[mkRow({pkgRow:true})];
+  }else if(mode==='edit-app'){
+    $('mr-title').textContent='编辑应用';
+    const g=rulesData[gi];
+    mrOldPkg=g.pkg;
+    mrOldThreads=new Set(g.items.filter(it=>it.thread).map(it=>it.thread));
+    const pkgItem=g.items.find(it=>!it.thread);
+    mrHadPkgRule=!!pkgItem;
+    mrRows=[mkRow({pkgRow:true,...(pkgItem?parseSpec(pkgItem.spec):{})})];
+    for(const it of g.items)if(it.thread)mrRows.push(mkRow({thread:it.thread,...parseSpec(it.spec)}));
+  }else if(mode==='edit-pkg'){
+    $('mr-title').textContent='包级默认规则';
+    mrRows=[mkRow({pkgRow:true,...parseSpec(rulesData[gi].items[ii].spec)})];
+  }else if(mode==='add-thread'){
+    $('mr-title').textContent='添加线程规则';
+    mrRows=[mkRow({})];
+  }else{
+    $('mr-title').textContent='编辑线程规则';
+    mrOldThread=rulesData[gi].items[ii].thread;
+    mrRows=[mkRow({thread:mrOldThread,...parseSpec(rulesData[gi].items[ii].spec)})];
+  }
+  renderRows('all');
+  ruleSheetReset();
+  $('modal-rule').hidden=false;
+  try{
+    history.pushState({tabStack:tabStack.slice(),modal:'rule'},'','#rule');
+    ruleSheetHistory=true;
+  }catch(e){}
+}
+$('r-add').onclick=()=>openRuleModal('add-pkg');
+$('mr-cancel').onclick=()=>ruleSheetClose();
+
+(function setupRuleSheetDrag(){
+  const bg=$('modal-rule'),sheet=bg.querySelector('.modal');
+  let sy=0,sx=0,ly=0,lt=0,dy=0,vy=0,active=false,enabled=false,timer=0,seq=0;
+  const clear=()=>{
+    sheet.classList.remove('dragging','snapping','closing');
+    sheet.style.transform='';sheet.style.transition='';sheet.style.opacity='';
+    bg.style.opacity='';bg.style.transition='';
+    ruleSheetClosing=false;
+  };
+  ruleSheetReset=()=>{seq++;clearTimeout(timer);clear()};
+  function settle(close){
+    if(bg.hidden)return;
+    if(close&&ruleSheetClosing)return;
+    const h=sheet.offsetHeight,instant=matchMedia('(prefers-reduced-motion:reduce)').matches;
+    if(close){
+      ruleSheetClosing=true;
+      seq++;
+      sheet.classList.remove('dragging','snapping');sheet.classList.add('closing');
+      bg.style.transition=instant?'none':'opacity .32s ease';
+      void sheet.offsetHeight;
+      sheet.style.transform='translateY(112%) scale(.98)';
+      sheet.style.opacity='0';
+      bg.style.opacity='0';
+      const token=seq;
+      if(instant){bg.hidden=true;clear();return}
+      timer=setTimeout(()=>{if(token!==seq)return;bg.hidden=true;clear()},360);
+      return;
+    }
+    ruleSheetClosing=false;
+    seq++;
+    sheet.classList.remove('dragging');sheet.classList.add('snapping');
+    sheet.style.transform='';
+    bg.style.transition=instant?'none':'opacity .3s ease';
+    bg.style.opacity='';
+    const token=seq;
+    if(instant){sheet.classList.remove('snapping');clear();return}
+    timer=setTimeout(()=>{if(token!==seq)return;sheet.classList.remove('snapping');clear()},345);
+  }
+  sheet.addEventListener('touchstart',e=>{
+    if(bg.hidden||e.touches.length!==1)return;
+    seq++;clearTimeout(timer);
+    const t=e.touches[0],rect=sheet.getBoundingClientRect();
+    sy=t.clientY;sx=t.clientX;ly=sy;lt=performance.now();dy=0;vy=0;active=false;
+    enabled=sheet.scrollTop<=0||t.clientY<rect.top+64;
+  },{passive:true});
+  sheet.addEventListener('touchmove',e=>{
+    if(!enabled||e.touches.length!==1)return;
+    const t=e.touches[0],ddy=t.clientY-sy,ddx=t.clientX-sx;
+    if(!active){
+      if(Math.abs(ddx)>Math.abs(ddy)&&Math.abs(ddx)>12){enabled=false;return}
+      if(ddy<10)return;
+      active=true;sheet.classList.add('dragging');bg.style.transition='none';
+    }
+    dy=Math.max(0,ddy);
+    const h=sheet.offsetHeight;
+    sheet.style.transform=`translateY(${dy}px)`;
+    bg.style.opacity=String(Math.max(0,1-dy/(h*1.15)));
+    const now=performance.now();
+    if(now>lt)vy=(t.clientY-ly)/(now-lt);
+    ly=t.clientY;lt=now;
+    e.preventDefault();
+  },{passive:false});
+  const end=e=>{
+    if(!active)return;
+    active=false;
+    if(e.cancelable)e.preventDefault();
+    const h=sheet.offsetHeight;
+    settle(dy>Math.min(140,h*0.25)||(dy>48&&vy>.28));
+  };
+  sheet.addEventListener('touchend',end,{passive:false});
+  sheet.addEventListener('touchcancel',end,{passive:false});
+  ruleSheetClose=(consumeHistory=true)=>{
+    settle(true);
+    if(consumeHistory&&ruleSheetHistory){
+      ruleSheetHistory=false;
+      try{history.back()}catch(e){}
+    }
+  };
+  bg.addEventListener('click',e=>{
+    if(e.target===bg&&!mrSaving)ruleSheetClose();
+  });
+  document.addEventListener('keydown',e=>{
+    if(e.key==='Escape'&&!bg.hidden)ruleSheetClose();
+  });
+})();
+let mrSaving=false;
+$('mr-save').onclick=async()=>{
+  if(mrSaving)return;
+  const pkg=$('mr-pkg').value.trim();
+  if(!$('mr-pkg').readOnly&&!pkg)return toast('请输入应用包名');
+  const jobs=[];
+  for(const r of mrRows){
+    const spec=specOf(r);
+    if(r.pkgRow){if(spec)jobs.push({thread:'',cpus:spec});continue}
+    if(!r.thread&&!spec)continue;
+    if(!r.thread)return toast('请输入线程名');
+    if(r.dyn){
+      if(!r.dynT[0].trim()||!r.dynT[1].trim())return toast('请为动态规则填写两档 CPU 规格');
+      if(r.dynMode==='load'&&!(+r.dynThr>=1&&+r.dynThr<=100))return toast('负载阈值需为 1-100 的数字');
+    }else if(!spec)return toast(r.custom?'请输入自定义 CPU 范围，如 0-3':'请选择 CPU 核心');
+    jobs.push({thread:r.thread,cpus:spec});
+  }
+  if(!jobs.length)return toast('请至少配置一条规则');
+  mrSaving=true;
+  const saveBtn=$('mr-save'),saveLabel=saveBtn.textContent;
+  saveBtn.disabled=true;saveBtn.textContent='保存中…';
+  try{
+    if(mrMode==='edit-app'){
+      if(pkg!==mrOldPkg)await api('/api/rule/rename',{old:mrOldPkg,new:pkg});
+      const cur=new Set(jobs.map(j=>j.thread));
+      for(const th of mrOldThreads)if(!cur.has(th))await api('/api/rule/del',{pkg,thread:th});
+      if(mrHadPkgRule&&!cur.has(''))await api('/api/rule/del',{pkg,thread:''});
+    }
+    if(mrMode==='edit-thread'&&mrOldThread!==jobs[0].thread)
+      await api('/api/rule/del',{pkg,thread:mrOldThread});
+    for(let i=0;i<jobs.length;i++){
+      const j=jobs[i];
+      try{await api('/api/rule',{pkg,thread:j.thread,cpus:j.cpus})}
+      catch(e){return toast(`第${i+1}条（${j.thread||'包级'}）失败：${e.message}`)}
+    }
+    ruleSheetClose();
+    toast('已保存');
+    loadRules();
+  }catch(e){toast(e.message)}
+  finally{mrSaving=false;saveBtn.disabled=false;saveBtn.textContent=saveLabel}
+};
+
+function suggest_bind(input, box, opts = {}) {
+  let seq = 0, hl = -1, items = [], tm = null;
+  const hide = () => { seq++; box.dataset.closed = '1'; box.hidden = true; hl = -1; };
+  const render = () => {
+    if (!items.length) { hide(); return; }
+    box.innerHTML = items.map((it, i) => `<div class="sg-item${i === hl ? ' hl' : ''}" data-i="${i}">${esc(it)}</div>`).join('');
+    box.hidden = false;
+    if (hl >= 0) box.children[hl]?.scrollIntoView({ block: 'nearest' });
+  };
+  const fetch_list = async () => {
+    const q = input.value.trim();
+    const pkg = opts.thread ? $('mr-pkg').value.trim() : '';
+    if (!q || (opts.thread && !pkg)) { hide(); return; }
+    const cur = ++seq;
+    box.dataset.closed = '';
+    const body = opts.thread ? { pkg, q } : { q };
+    try {
+      const d = await api('/api/suggest', body);
+      if (cur !== seq || box.dataset.closed) return;
+      items = d.list; hl = -1; render();
+    } catch (e) {}
+  };
+  input.addEventListener('input', () => { clearTimeout(tm); tm = setTimeout(fetch_list, 250); });
+  const pick = v => { input.value = v; opts.onpick?.(v); hide(); };
+  input.addEventListener('keydown', e => {
+    if (box.hidden || !items.length) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault(); hl = (hl + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length; render();
+    } else if (e.key === 'Enter' && hl >= 0) {
+      e.preventDefault(); pick(items[hl]);
+    } else if (e.key === 'Escape') hide();
+  });
+  box.addEventListener('click', e => {
+    const it = e.target.closest('.sg-item');
+    if (it) pick(items[+it.dataset.i]);
+  });
+  input.addEventListener('blur', () => setTimeout(() => {
+    if (document.activeElement !== input && !box.hidden) hide();
+  }, 150));
+}
+const sgClose = b => { b.hidden = true; b.dataset.closed = '1'; };
+const closeThreadSuggest = () => document.querySelectorAll('#mr-rows .sg-box:not([hidden])').forEach(sgClose);
+suggest_bind($('mr-pkg'), $('sg-pkg'), { onpick: closeThreadSuggest });
+$('mr-pkg').addEventListener('input', closeThreadSuggest);
+document.addEventListener('pointerdown', e => {
+  if (!e.target.closest('.sg-wrap'))
+    document.querySelectorAll('.sg-box:not([hidden])').forEach(sgClose);
+});
+
+let confirmCb=null;
+function resetConfirm(){
+  confirmSeq++;clearTimeout(confirmTimer);
+  const bg=$('modal-confirm'),sheet=bg.querySelector('.modal');
+  sheet.classList.remove('closing');
+  sheet.style.transform='';sheet.style.opacity='';sheet.style.transition='';
+  bg.style.opacity='';bg.style.transition='';
+  confirmClosing=false;
+}
+function closeConfirm(consume=true){
+  const bg=$('modal-confirm');
+  if(bg.hidden)return;
+  if(!confirmClosing){
+    confirmClosing=true;
+    const sheet=bg.querySelector('.modal');
+    sheet.classList.add('closing');
+    bg.style.transition='opacity .22s ease';
+    void sheet.offsetHeight;
+    sheet.style.transform='translateY(112%)';sheet.style.opacity='0';
+    bg.style.opacity='0';
+    const token=++confirmSeq;
+    const instant=matchMedia('(prefers-reduced-motion:reduce)').matches;
+    if(instant){bg.hidden=true;resetConfirm()}
+    else confirmTimer=setTimeout(()=>{if(token!==confirmSeq)return;bg.hidden=true;resetConfirm()},250);
+  }
+  if(consume&&confirmHistory){confirmHistory=false;try{history.back()}catch(e){}}
+}
+function confirmDel(msg,body){
+  resetConfirm();
+  $('mc-msg').textContent=msg;
+  confirmCb=async()=>{
+    try{await api('/api/rule/del',body);toast('已删除');loadRules()}
+    catch(e){toast(e.message)}
+  };
+  $('modal-confirm').hidden=false;
+  try{history.pushState({tabStack:tabStack.slice(),modal:'confirm'},'','#confirm');confirmHistory=true}catch(e){}
+}
+function delRule(gi,ii){
+  const g=rulesData[gi],it=g.items[ii];
+  confirmDel((it.thread?'线程 '+it.thread:'包级规则')+' · '+g.pkg,{pkg:g.pkg,thread:it.thread||''});
+}
+function delPkg(gi){
+  const g=rulesData[gi];
+  confirmDel(`删除 ${g.pkg} 的全部 ${g.items.length} 条规则`,{pkg:g.pkg,all:true});
+}
+$('mc-cancel').onclick=()=>closeConfirm();
+$('mc-ok').onclick=()=>{closeConfirm();confirmCb&&confirmCb()};
+$('modal-confirm').addEventListener('click',e=>{if(e.target===$('modal-confirm'))closeConfirm()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('modal-confirm').hidden)closeConfirm()});
+
+let swipeState=null;
+function resetPanelStyles(el){
+  el.style.transition='';el.style.transform='';el.style.opacity='';
+}
+function commitTab(t){
+  if(t===activeTab)return;
+  tabAnimSeq++;
+  activeTab=t;setTabActive(t);
+  ['status','rules','settings'].forEach(n=>{
+    const el=$('tab-'+n);
+    el.hidden=n!==t;
+    if(n!==t)resetPanelStyles(el);
+  });
+  resetPanelStyles($('tab-'+t));
+  tabSideEffects(t);
+}
+const mainEl=document.querySelector('.main');
+mainEl.addEventListener('touchstart',e=>{
+  if(e.touches.length!==1||activeTab==='status')return;
+  if($('page-about').classList.contains('show'))return;
+  if([...document.querySelectorAll('.modal-bg')].some(m=>!m.hidden))return;
+  const t=e.touches[0];
+  if(t.clientX>28)return;
+  const prev=tabStack.length>1?tabStack[tabStack.length-2]:null;
+  if(!prev||prev===activeTab)return;
+  swipeState={x0:t.clientX,y0:t.clientY,from:$('tab-'+activeTab),to:$('tab-'+prev),prev,dx:0,active:false};
+},{passive:true});
+mainEl.addEventListener('touchmove',e=>{
+  if(!swipeState)return;
+  const t=e.touches[0],dx=t.clientX-swipeState.x0,dy=Math.abs(t.clientY-swipeState.y0);
+  if(!swipeState.active){
+    if(dx<8||dx<dy)return;
+    swipeState.active=true;
+    const to=swipeState.to;
+    to.hidden=false;
+    to.style.transition='none';
+    to.style.transform='translateX(-26%) scale(.97)';
+    to.style.opacity='.55';
+    swipeState.from.style.transition='none';
+  }
+  e.preventDefault();
+  const p=Math.min(1,Math.max(0,dx)/(innerWidth*.9));
+  swipeState.dx=Math.max(0,dx);
+  swipeState.from.style.transform=`translateX(${swipeState.dx}px)`;
+  swipeState.to.style.transform=`translateX(${-26+26*p}%) scale(${.97+.03*p})`;
+  swipeState.to.style.opacity=String(.55+.45*p);
+},{passive:false});
+function endTabSwipe(){
+  if(!swipeState)return;
+  const s=swipeState;swipeState=null;
+  if(!s.active)return;
+  const ease='transform .34s var(--spring), opacity .26s ease';
+  s.from.style.transition=ease;s.to.style.transition=ease;
+  if(s.dx>innerWidth*.32){
+    s.from.style.transform='translateX(100%)';s.from.style.opacity='0';
+    s.to.style.transform='none';s.to.style.opacity='1';
+    setTimeout(()=>{
+      s.from.hidden=true;
+      resetPanelStyles(s.from);resetPanelStyles(s.to);
+      commitTab(s.prev);
+      if(history.state&&history.state.tabStack&&history.state.tabStack.length>1){
+        try{history.back()}catch(e){}
+      }
+    },360);
+  }else{
+    s.from.style.transform='none';s.from.style.opacity='1';
+    s.to.style.transform='translateX(-26%) scale(.97)';s.to.style.opacity='.55';
+    setTimeout(()=>{
+      s.to.hidden=true;
+      resetPanelStyles(s.from);resetPanelStyles(s.to);
+    },360);
+  }
+}
+mainEl.addEventListener('touchend',endTabSwipe,{passive:true});
+mainEl.addEventListener('touchcancel',endTabSwipe,{passive:true});
+
+let aboutSwipe=null;
+const aboutPage=$('page-about');
+aboutPage.addEventListener('touchstart',e=>{
+  if(e.touches.length!==1)return;
+  const t=e.touches[0];
+  if(t.clientX>28)return;
+  aboutSwipe={x0:t.clientX,y0:t.clientY,dx:0,active:false};
+},{passive:true});
+aboutPage.addEventListener('touchmove',e=>{
+  if(!aboutSwipe)return;
+  const t=e.touches[0],dx=t.clientX-aboutSwipe.x0,dy=Math.abs(t.clientY-aboutSwipe.y0);
+  if(!aboutSwipe.active){
+    if(dx<8||dx<dy)return;
+    aboutSwipe.active=true;
+    aboutPage.style.transition='none';
+  }
+  e.preventDefault();
+  aboutSwipe.dx=Math.max(0,dx);
+  aboutPage.style.transform=`translateX(${aboutSwipe.dx}px)`;
+},{passive:false});
+function endAboutSwipe(){
+  if(!aboutSwipe)return;
+  const s=aboutSwipe;aboutSwipe=null;
+  if(!s.active)return;
+  if(s.dx>innerWidth*.3){
+    aboutPage.style.transition='transform .34s var(--spring)';
+    aboutPage.style.transform='translateX(101%)';
+    setTimeout(()=>closeAbout(false),340);
+  }else{
+    aboutPage.style.transition='transform .34s var(--spring)';
+    aboutPage.style.transform='none';
+    setTimeout(()=>{aboutPage.style.transition='';aboutPage.style.transform='';},340);
+  }
+}
+aboutPage.addEventListener('touchend',endAboutSwipe,{passive:true});
+aboutPage.addEventListener('touchcancel',endAboutSwipe,{passive:true});
+async function loadCfg(){
+  try{
+    const d=await api('/api/config');
+    document.querySelectorAll('#seg-mode button').forEach(b=>b.classList.toggle('on',+b.dataset.mode===d.mode));
+    $('c-mode-active').textContent='当前生效: '+modeLabel(d.mode_active);
+    $('c-ebpf-hint').hidden=d.ebpf_available;
+    $('c-interval').value=d.interval;
+    $('c-cpuset').value=d.cpuset_name;
+    $('c-file').value=d.config_file;
+    $('c-port').value=d.web_port;
+    $('c-cpuset-on').textContent=d.cpuset_enabled?'已启用':'不可用';
+  }catch(e){toast(e.message)}
+}
+document.querySelectorAll('#seg-mode button').forEach(b=>b.onclick=async()=>{
+  try{await api('/api/config',{mode:+b.dataset.mode});toast('已切换');loadCfg()}
+  catch(e){toast(e.message)}
+});
+async function saveField(body){
+  try{await api('/api/config',body);toast('已保存');loadCfg()}
+  catch(e){toast(e.message)}
+}
+$('c-interval-save').onclick=()=>saveField({interval:Math.max(1,+$('c-interval').value||0)});
+$('c-cpuset-save').onclick=()=>saveField({cpuset_name:$('c-cpuset').value.trim()});
+$('c-file-save').onclick=()=>saveField({config_file:$('c-file').value.trim()});
+$('c-port-save').onclick=async()=>{
+  const p=+$('c-port').value||0;
+  if(p<1024||p>65535)return toast('端口需在 1024-65535 之间');
+  const btn=$('c-port-save'),label=btn.textContent;
+  btn.disabled=true;btn.textContent='切换中…';
+  try{
+    const d=await api('/api/config',{web_port:p});
+    toast('端口已切换，正在跳转');
+    setTimeout(()=>{location.href='http://'+location.hostname+':'+d.web_port+'/'},900);
+  }catch(e){btn.disabled=false;btn.textContent=label;toast(e.message)}
+};
+
+function openAbout(){
+  $('page-about').classList.add('show');
+  document.querySelector('.app').classList.add('pushing');
+  try{history.pushState({tabStack:tabStack.slice(),about:true},'','#about')}catch(e){}
+  api('/api/status').then(d=>{$('a-ver').textContent='v'+d.version}).catch(()=>{});
+}
+function closeAbout(fromHistory){
+  $('page-about').classList.remove('show');
+  document.querySelector('.app').classList.remove('pushing');
+  $('page-about').style.transition='';$('page-about').style.transform='';
+  if(!fromHistory&&history.state&&history.state.about){
+    try{history.back()}catch(e){}
+  }
+}
+$('c-about').onclick=openAbout;
+$('about-back').onclick=()=>closeAbout(false);
+
+startStat();
+</script>
+</body>
+</html>

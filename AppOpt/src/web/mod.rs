@@ -1,0 +1,737 @@
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+use crate::platform::affinity::{proc_snapshot, read_cmdline, task_tids, tid_comm};
+use crate::engine::cache::ProcCache;
+use crate::config::{
+    config_reload_now, dyn_spec_try, spec_like,
+    CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, DynSpec, FORCE_RELOAD, PARSE_FAILS,
+};
+use crate::platform::cpuset::{
+    base_cpuset, create_cpuset_dir, parse_cpu_spec, remove_cpuset_dir, set_base_cpuset, CpuSet,
+    CpuTopology, DEFAULT_CPUSET_NAME,
+};
+use crate::engine::ebpf::ebpf_probe;
+use crate::rules::editor::{rule_delete, rule_delete_pkg, rule_rename, rule_upsert, RuleEdit};
+use crate::{lock_ignore_poison, EBPF_GAVE_UP, MAX_PKG_LEN, MAX_THREAD_LEN};
+
+mod settings;
+pub use settings::*;
+
+pub static WEB_PORT_CUR: AtomicU16 = AtomicU16::new(0);
+pub static WEB_PORT_TARGET: AtomicU16 = AtomicU16::new(8889);
+const INDEX_HTML: &str = include_str!("../../web/index.html");
+
+pub static MODE_FORCE: AtomicU8 = AtomicU8::new(0);
+pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub static WEB_STATS: Mutex<Option<WebStats>> = Mutex::new(None);
+const MAX_CONNS: usize = 64;
+static CONN_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+const MAX_HEAD_BYTES: usize = 8192;
+const MAX_BODY_BYTES: usize = 16384;
+const MAX_SUGGEST_QUERY: usize = 64;
+const SUGGEST_CACHE_MAX: usize = 16;
+const SUGGEST_TTL: Duration = Duration::from_secs(3);
+static SUGGEST_PKG_CACHE: Mutex<Option<(Instant, BTreeMap<String, usize>)>> = Mutex::new(None);
+type ThreadSuggestCache = BTreeMap<String, (Instant, BTreeMap<String, usize>)>;
+static SUGGEST_THREAD_CACHE: Mutex<ThreadSuggestCache> = Mutex::new(BTreeMap::new());
+
+#[derive(Clone)]
+pub struct WebStats {
+    pub rules: usize,
+    pub pkgs: usize,
+    pub hit_pkgs: usize,
+    pub threads: usize,
+    pub ebpf: bool,
+    pub uptime: u64,
+}
+pub fn cache_stats(cache: &ProcCache) -> (usize, usize) {
+    let pkgs: HashSet<&str> = cache.tasks.values().map(|e| e.pkg.as_str()).collect();
+    (cache.tasks.len(), pkgs.len())
+}
+fn webroot_port_path() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("APPOPT_WEBROOT") {
+        return Some(std::path::PathBuf::from(dir).join("port.js"));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent()?.to_path_buf();
+    for _ in 0..5 {
+        let webroot = dir.join("webroot");
+        if webroot.join("index.html").is_file() {
+            return Some(webroot.join("port.js"));
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    None
+}
+
+pub fn sync_webroot_port(port: u16) {
+    let Some(path) = webroot_port_path() else { return };
+    let body = format!("window.APPOPT_PORT={};\n", port);
+    if let Err(e) = fs::write(&path, body) {
+        eprintln!("Web: 写入 {} 失败 ({})", path.display(), e);
+    }
+}
+
+pub fn web_start(port: u16) {
+    WEB_PORT_TARGET.store(port, Ordering::Release);
+    WEB_ENABLED.store(true, Ordering::Release);
+    thread::spawn(move || {
+        let mut listener: Option<TcpListener> = None;
+        loop {
+            let target = WEB_PORT_TARGET.load(Ordering::Acquire);
+            if listener.is_some() {
+                let cur = WEB_PORT_CUR.load(Ordering::Acquire);
+                if cur != target {
+                    match TcpListener::bind(("127.0.0.1", target)) {
+                        Ok(new_listener) => {
+                            listener = Some(new_listener);
+                            WEB_PORT_CUR.store(target, Ordering::Release);
+                            println!("Web: 端口切换 http://127.0.0.1:{}/", target);
+                            sync_webroot_port(target);
+                        }
+                        Err(e) => {
+                            eprintln!("Web: 切换端口 {} 失败 ({})，保持 {}", target, e, cur);
+                            WEB_PORT_TARGET.store(cur, Ordering::Release);
+                        }
+                    }
+                }
+            } else {
+                match TcpListener::bind(("127.0.0.1", target)) {
+                    Ok(l) => {
+                        WEB_PORT_CUR.store(target, Ordering::Release);
+                        println!("Web: 前端已启用 http://127.0.0.1:{}/", target);
+                        sync_webroot_port(target);
+                        listener = Some(l);
+                    }
+                    Err(e) => {
+                        eprintln!("Web: 监听 127.0.0.1:{} 失败 ({})", target, e);
+                        thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                }
+            }
+            let Some(l) = listener.as_ref() else { continue };
+            let _ = l.set_nonblocking(true);
+            let mut rebind = false;
+            for _ in 0..20 {
+                match l.accept() {
+                    Ok((stream, _)) => {
+                        if CONN_ACTIVE.fetch_add(1, Ordering::Relaxed) >= MAX_CONNS {
+                            CONN_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+                            drop(stream);
+                            continue;
+                        }
+                        thread::spawn(move || {
+                            conn_handle(stream);
+                            CONN_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(50));
+                        if WEB_PORT_TARGET.load(Ordering::Acquire) != WEB_PORT_CUR.load(Ordering::Acquire) {
+                            rebind = true;
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if rebind {
+                continue;
+            }
+        }
+    });
+}
+
+struct Request {
+    method: String,
+    path: String,
+    host: String,
+    origin: String,
+    fetch_site: String,
+    content_type: String,
+    body: Vec<u8>,
+    keep_alive: bool,
+}
+
+fn conn_handle(stream: TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_nodelay(true);
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+    let mut reader = BufReader::new(stream);
+    while let Some(req) = request_read(&mut reader) {
+        dispatch(&mut writer, &req);
+        if !req.keep_alive {
+            return;
+        }
+    }
+}
+
+fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
+    let mut head = Vec::with_capacity(512);
+    let mut line = Vec::with_capacity(128);
+    loop {
+        line.clear();
+        reader.read_until(b'\n', &mut line).ok()?;
+        if line.is_empty() {
+            return None;
+        }
+        if line == b"\r\n" || line == b"\n" {
+            break;
+        }
+        head.extend_from_slice(&line);
+        if head.len() > MAX_HEAD_BYTES {
+            return None;
+        }
+    }
+
+    let head_str = String::from_utf8_lossy(&head);
+    let mut lines = head_str.lines();
+    let mut parts = lines.next()?.split_whitespace();
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.split('?').next().unwrap_or("").to_string();
+    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+
+    let (mut host, mut origin, mut site, mut ctype, mut len) =
+        (String::new(), String::new(), String::new(), String::new(), 0usize);
+    let mut conn = String::new();
+    for h in lines {
+        let Some((k, v)) = h.split_once(':') else { continue };
+        let v = v.trim();
+        match k.trim().to_ascii_lowercase().as_str() {
+            "host" => host = v.to_ascii_lowercase(),
+            "origin" => origin = v.to_ascii_lowercase(),
+            "sec-fetch-site" => site = v.to_ascii_lowercase(),
+            "content-type" => ctype = v.to_ascii_lowercase(),
+            "content-length" => len = v.parse().unwrap_or(usize::MAX),
+            "connection" => conn = v.to_ascii_lowercase(),
+            "transfer-encoding" => return None,
+            _ => {}
+        }
+    }
+    if len > MAX_BODY_BYTES {
+        return None;
+    }
+
+    let mut body = vec![0u8; len];
+    if len > 0 {
+        reader.read_exact(&mut body).ok()?;
+    }
+    let keep_alive = if version == "HTTP/1.0" {
+        conn.contains("keep-alive")
+    } else {
+        !conn.contains("close")
+    };
+    Some(Request {
+        method,
+        path,
+        host,
+        origin,
+        fetch_site: site,
+        content_type: ctype,
+        body,
+        keep_alive,
+    })
+}
+
+fn resp_send(out: &mut TcpStream, status: u16, ctype: &str, body: &[u8], close: bool) {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        _ => "Error",
+    };
+    let head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: {}\r\n\r\n",
+        status,
+        reason,
+        ctype,
+        body.len(),
+        if close { "close" } else { "keep-alive" }
+    );
+    let _ = out.write_all(head.as_bytes());
+    let _ = out.write_all(body);
+    let _ = out.flush();
+}
+
+fn dispatch(out: &mut TcpStream, req: &Request) {
+    let port_str = format!(":{}", WEB_PORT_CUR.load(Ordering::Acquire));
+    let host = req.host.strip_suffix(&port_str).unwrap_or(req.host.as_str());
+    let origin_ok = matches!(host, "127.0.0.1" | "localhost")
+        && (req.origin.is_empty()
+            || req.origin == "null"
+            || matches!(req.fetch_site.as_str(), "" | "none" | "same-origin"))
+        && (req.method != "POST" || req.content_type.starts_with("application/json"));
+    if !origin_ok {
+        resp_send(out, 403, "application/json", b"{\"ok\":false,\"err\":\"forbidden\"}", true);
+        return;
+    }
+
+    if req.method == "GET" && matches!(req.path.as_str(), "/" | "/index.html") {
+        resp_send(out, 200, "text/html; charset=utf-8", INDEX_HTML.as_bytes(), !req.keep_alive);
+        return;
+    }
+
+    let (status, body) = match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/api/status") => (200, status_json()),
+        ("GET", "/api/rules") => (200, rules_json()),
+        ("GET", "/api/config") => (200, config_json()),
+        ("POST", "/api/rule") => rule_api(req),
+        ("POST", "/api/rule/del") => rule_del_api(req),
+        ("POST", "/api/rule/rename") => rule_rename_api(req),
+        ("POST", "/api/config") => config_set_api(req),
+        ("POST", "/api/suggest") => suggest_api(req),
+        _ => err_json(404, "not found"),
+    };
+    resp_send(out, status, "application/json", body.as_bytes(), !req.keep_alive);
+}
+
+fn err_json(code: u16, msg: &str) -> (u16, String) {
+    (code, json!({ "ok": false, "err": msg }).to_string())
+}
+
+fn current_cfg() -> Option<std::sync::Arc<crate::config::AppConfig>> {
+    lock_ignore_poison(&CURRENT_CONFIG).clone()
+}
+
+fn sys_procs() -> u16 {
+    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sysinfo(&mut info) } == 0 {
+        info.procs
+    } else {
+        0
+    }
+}
+fn spec_name(cpus: &CpuSet, topo: &CpuTopology) -> String {
+    if cpus.count() > 0 {
+        if *cpus == topo.e_core {
+            return "e-core".into();
+        }
+        if *cpus == topo.m_core {
+            return "m-core".into();
+        }
+        if *cpus == topo.p_core {
+            return "p-core".into();
+        }
+        if *cpus == topo.hp_core {
+            return "hp-core".into();
+        }
+        if *cpus == topo.present_cpus {
+            return "all-core".into();
+        }
+    }
+    cpus.to_range_string()
+}
+fn dyn_spec_str(spec: &DynSpec, topo: &CpuTopology) -> String {
+    match spec {
+        DynSpec::Elect { winner, others } => format!(
+            "elect({} | {})",
+            spec_name(winner, topo),
+            spec_name(others, topo)
+        ),
+        DynSpec::Load {
+            high,
+            low,
+            threshold,
+        } => format!(
+            "load({} | {} | {})",
+            spec_name(high, topo),
+            spec_name(low, topo),
+            threshold
+        ),
+    }
+}
+
+fn status_json() -> String {
+    let stats = lock_ignore_poison(&WEB_STATS).clone();
+    let cfg = current_cfg();
+    let topo = cfg.as_ref().map(|c| &c.topo);
+    let s = stats.unwrap_or(WebStats {
+        rules: 0,
+        pkgs: 0,
+        hit_pkgs: 0,
+        threads: 0,
+        ebpf: false,
+        uptime: 0,
+    });
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "mode": if s.ebpf { "ebpf" } else { "proc" },
+        "uptime": s.uptime,
+        "rules": s.rules,
+        "pkgs": s.pkgs,
+        "parse_fail": PARSE_FAILS.load(Ordering::Relaxed),
+        "hit_pkgs": s.hit_pkgs,
+        "threads": s.threads,
+        "total_procs": sys_procs(),
+        "interval": CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
+        "e_core": topo.map(|t| t.e_core.to_range_string()).unwrap_or_default(),
+        "m_core": topo.map(|t| t.m_core.to_range_string()).unwrap_or_default(),
+        "p_core": topo.map(|t| t.p_core.to_range_string()).unwrap_or_default(),
+        "hp_core": topo.map(|t| t.hp_core.to_range_string()).unwrap_or_default(),
+        "all_core": topo.map(|t| t.present_str.clone()).unwrap_or_default(),
+        "cores": topo.map(|t| t.present_cpus.count()).unwrap_or(0),
+        "cpuset_enabled": topo.is_some_and(|t| t.cpuset_enabled),
+    })
+    .to_string()
+}
+
+fn rules_json() -> String {
+    let Some(cfg) = current_cfg() else {
+        return json!({ "rules": [] }).to_string();
+    };
+    let mut spec_cache: HashMap<CpuSet, String> = HashMap::new();
+    let mut groups: Vec<serde_json::Value> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for r in &cfg.rules {
+        let gi = *index.entry(r.pkg.clone()).or_insert_with(|| {
+            groups.push(json!({ "pkg": r.pkg, "items": [] }));
+            groups.len() - 1
+        });
+        let spec = spec_cache
+            .entry(r.cpus)
+            .or_insert_with(|| spec_name(&r.cpus, &cfg.topo))
+            .clone();
+        groups[gi]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "thread": r.thread, "spec": spec }));
+    }
+    for r in &cfg.dyn_rules {
+        let gi = *index.entry(r.pkg.clone()).or_insert_with(|| {
+            groups.push(json!({ "pkg": r.pkg, "items": [] }));
+            groups.len() - 1
+        });
+        groups[gi]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "thread": r.thread,
+                "spec": dyn_spec_str(&r.spec, &cfg.topo),
+                "dyn": true,
+            }));
+    }
+    json!({ "rules": groups }).to_string()
+}
+fn token_ok(s: &str, max: usize) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && t.len() < max
+        && !t.bytes().any(|b| b < 0x20 || b == 0x7f)
+        && !t.contains('#')
+        && !t.contains("//")
+        && !t.contains(['=', '{', '}'])
+}
+
+fn rule_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let (Some(pkg), Some(cpus)) = (
+        v["pkg"].as_str().map(str::trim),
+        v["cpus"].as_str().map(str::trim),
+    ) else {
+        return err_json(400, "缺少 pkg 或 cpus 字段");
+    };
+    let thread = v["thread"].as_str().map(str::trim).unwrap_or("");
+    let Some(cfg) = current_cfg() else {
+        return err_json(500, "配置未就绪");
+    };
+    if !token_ok(pkg, MAX_PKG_LEN) || (!thread.is_empty() && !token_ok(thread, MAX_THREAD_LEN)) {
+        return err_json(400, "名称含有非法字符");
+    }
+    let spec_ok = (spec_like(cpus) && parse_cpu_spec(cpus, &cfg.topo).count() != 0)
+        || dyn_spec_try(cpus, &cfg.topo).is_some();
+    if cpus.is_empty() || cpus.len() >= 128 || !spec_ok {
+        return err_json(400, "无效的 CPU 规格");
+    }
+
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    match rule_upsert(&file, pkg, thread, cpus) {
+        RuleEdit::Ok => {
+            config_reload_now();
+            (200, json!({ "ok": true }).to_string())
+        }
+        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
+        _ => err_json(500, "配置文件写入失败"),
+    }
+}
+
+fn rule_del_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let Some(pkg) = v["pkg"].as_str().map(str::trim) else {
+        return err_json(400, "缺少 pkg 字段");
+    };
+    let thread = v["thread"].as_str().map(str::trim).unwrap_or("");
+
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    let result = if v["all"].as_bool().unwrap_or(false) {
+        rule_delete_pkg(&file, pkg)
+    } else {
+        rule_delete(&file, pkg, thread)
+    };
+    match result {
+        RuleEdit::Ok => {
+            config_reload_now();
+            (200, json!({ "ok": true }).to_string())
+        }
+        RuleEdit::NotFound => err_json(404, "规则不存在"),
+        RuleEdit::Conflict => err_json(409, "状态冲突"),
+        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
+        RuleEdit::IoErr => err_json(500, "配置文件写入失败"),
+    }
+}
+
+fn rule_rename_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let (Some(old), Some(new)) =
+        (v["old"].as_str().map(str::trim), v["new"].as_str().map(str::trim))
+    else {
+        return err_json(400, "缺少 old 或 new 字段");
+    };
+    if !token_ok(old, MAX_PKG_LEN) || !token_ok(new, MAX_PKG_LEN) {
+        return err_json(400, "名称含有非法字符");
+    }
+    if old == new {
+        return (200, json!({ "ok": true }).to_string());
+    }
+
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    match rule_rename(&file, old, new) {
+        RuleEdit::Ok => {
+            config_reload_now();
+            (200, json!({ "ok": true }).to_string())
+        }
+        RuleEdit::NotFound => err_json(404, "原包名不存在"),
+        RuleEdit::Conflict => err_json(409, "目标包名已存在规则"),
+        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
+        RuleEdit::IoErr => err_json(500, "配置文件写入失败"),
+    }
+}
+fn suggest_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let q = v["q"].as_str().map(str::trim).unwrap_or("");
+    if q.len() > MAX_SUGGEST_QUERY {
+        return err_json(400, "q 过长");
+    }
+    let list: Vec<String> = match v["pkg"].as_str().map(str::trim).filter(|p| !p.is_empty()) {
+        None => suggest_pkgs(q).into_iter().map(|(n, _)| n).collect(),
+        Some(pkg) => {
+            if !token_ok(pkg, MAX_PKG_LEN) {
+                return err_json(400, "名称含有非法字符");
+            }
+            suggest_threads(pkg, q).into_iter().map(|(n, _)| n).collect()
+        }
+    };
+    (200, json!({ "ok": true, "list": list }).to_string())
+}
+fn installed_pkgs() -> Vec<String> {
+    fs::read_dir("/data/data")
+        .map(|dirs| {
+            dirs.flatten()
+                .map(|d| d.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains('.') && !n.starts_with('.'))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn for_each_pid(mut f: impl FnMut(i32)) {
+    if let Some(pids) = proc_snapshot() {
+        for pid in pids {
+            f(pid);
+        }
+    }
+}
+fn rank_top(counts: BTreeMap<String, usize>, lq: &str) -> Vec<(String, usize)> {
+    let mut ranked: Vec<(u8, Reverse<usize>, String)> = counts
+        .into_iter()
+        .filter_map(|(n, c)| {
+            let ln = n.to_ascii_lowercase();
+            let r = if ln.starts_with(lq) { 0 } else if ln.contains(lq) { 1 } else { 2 };
+            (r < 2).then_some((r, Reverse(c), n))
+        })
+        .collect();
+    ranked.sort_unstable();
+    ranked.truncate(20);
+    ranked.into_iter().map(|(_, Reverse(c), n)| (n, c)).collect()
+}
+
+fn suggest_pkgs(q: &str) -> Vec<(String, usize)> {
+    let counts: BTreeMap<String, usize> = {
+        let mut guard = lock_ignore_poison(&SUGGEST_PKG_CACHE);
+        if let Some((t, c)) = guard.as_ref()
+            && t.elapsed() < SUGGEST_TTL
+        {
+            c.clone()
+        } else {
+            let mut m: BTreeMap<String, usize> =
+                installed_pkgs().into_iter().map(|p| (p, 0)).collect();
+            for_each_pid(|pid| {
+                if let Some(name) = read_cmdline(pid).filter(|n| n.contains('.')) {
+                    *m.entry(name).or_insert(0) += 1;
+                }
+            });
+            *guard = Some((Instant::now(), m.clone()));
+            m
+        }
+    };
+    rank_top(counts, &q.to_ascii_lowercase())
+}
+
+fn suggest_threads(pkg: &str, q: &str) -> Vec<(String, usize)> {
+    let counts: BTreeMap<String, usize> = {
+        let mut guard = lock_ignore_poison(&SUGGEST_THREAD_CACHE);
+        if let Some((t, c)) = guard.get(pkg)
+            && t.elapsed() < SUGGEST_TTL
+        {
+            c.clone()
+        } else {
+            let mut m: BTreeMap<String, usize> = BTreeMap::new();
+            for_each_pid(|pid| {
+                if read_cmdline(pid).as_deref() == Some(pkg) {
+                    for tid in task_tids(pid).unwrap_or_default() {
+                        if let Some(comm) = tid_comm(tid) {
+                            *m.entry(comm).or_insert(0) += 1;
+                        }
+                    }
+                }
+            });
+            guard.insert(pkg.to_string(), (Instant::now(), m.clone()));
+            guard.retain(|_, (t, _)| t.elapsed() < SUGGEST_TTL);
+            while guard.len() > SUGGEST_CACHE_MAX {
+                let Some(oldest) = guard
+                    .iter()
+                    .max_by_key(|(_, (t, _))| *t)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                guard.remove(&oldest);
+            }
+            m
+        }
+    };
+    rank_top(counts, &q.to_ascii_lowercase())
+}
+
+fn ebpf_probe_cached() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(ebpf_probe)
+}
+
+fn config_json() -> String {
+    let stats = lock_ignore_poison(&WEB_STATS).clone();
+    let cfg = current_cfg();
+    json!({
+        "mode": MODE_FORCE.load(Ordering::Relaxed),
+        "mode_active": if stats.is_some_and(|s| s.ebpf) { "ebpf" } else { "proc" },
+        "ebpf_available": ebpf_probe_cached(),
+        "interval": CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
+        "cpuset_name": base_cpuset().rsplit('/').next().unwrap_or_default(),
+        "config_file": lock_ignore_poison(&CONFIG_FILE).clone(),
+        "web_port": WEB_PORT_CUR.load(Ordering::Acquire),
+        "cpuset_enabled": cfg.is_some_and(|c| c.topo.cpuset_enabled),
+    })
+    .to_string()
+}
+
+fn config_set_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let mode = v["mode"].as_u64();
+    let interval = v["interval"].as_u64();
+    let name = v["cpuset_name"].as_str();
+    let path = v["config_file"].as_str();
+    let port = v["web_port"].as_u64();
+
+    if mode.is_some_and(|m| m > 2) {
+        return err_json(400, "无效的工作模式");
+    }
+    if interval.is_some_and(|n| !(1..=3600).contains(&n)) {
+        return err_json(400, "间隔需在 1-3600 秒之间");
+    }
+    if name.is_some_and(|n| !valid_name(n)) {
+        return err_json(400, "无效的 cpuset 目录名");
+    }
+    if path.is_some_and(|p| !valid_path(p)) {
+        return err_json(400, "无效的配置文件路径");
+    }
+    if port.is_some_and(|p| !(1024..=65535).contains(&p)) {
+        return err_json(400, "端口需在 1024-65535 之间");
+    }
+
+    if let Some(m) = mode {
+        MODE_FORCE.store(m as u8, Ordering::Relaxed);
+        if m != 2 {
+            EBPF_GAVE_UP.store(false, Ordering::Relaxed);
+        }
+    }
+    if let Some(n) = interval {
+        CHECK_INTERVAL.store(n, Ordering::Relaxed);
+    }
+    if let Some(n) = name {
+        let old = base_cpuset();
+        set_base_cpuset(n);
+        if old != base_cpuset() {
+            remove_cpuset_dir(old.rsplit('/').next().unwrap_or_default());
+        }
+        if let Some(cfg) = current_cfg() {
+            lock_ignore_poison(&cfg.cpuset_dirs).clear();
+            if cfg.topo.cpuset_enabled {
+                create_cpuset_dir(base_cpuset(), &cfg.topo.present_str, &cfg.topo.mems_str);
+            }
+        }
+        FORCE_RELOAD.store(true, Ordering::Release);
+    }
+    if let Some(p) = port {
+        let p = p as u16;
+        let cur = WEB_PORT_CUR.load(Ordering::Acquire);
+        if p != cur {
+            match TcpListener::bind(("127.0.0.1", p)) {
+                Ok(test) => drop(test),
+                Err(e) => {
+                    return err_json(400, &format!("端口 {} 无法监听: {}", p, e));
+                }
+            }
+            WEB_PORT_TARGET.store(p, Ordering::Release);
+        }
+    }
+    if let Some(p) = path {
+        match std::fs::metadata(p) {
+            Err(_) => {
+                let _ = std::fs::write(p, "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n");
+            }
+            Ok(m) if m.is_dir() => return err_json(400, "配置文件路径不能是目录"),
+            Ok(_) => {}
+        }
+        *lock_ignore_poison(&CONFIG_FILE) = p.to_string();
+        FORCE_RELOAD.store(true, Ordering::Release);
+    }
+
+    settings_save();
+    (200, json!({ "ok": true, "web_port": WEB_PORT_TARGET.load(Ordering::Acquire) }).to_string())
+}
